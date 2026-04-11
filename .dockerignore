@@ -1,0 +1,10 @@
+.git
+.gitignore
+*.md
+config.json
+setup.js
+troubleshoot.js
+*.log
+node_modules/
+.env
+.env.*

@@ -1,0 +1,54 @@
+{
+  "_comment": "Relevant models/agents section of ~/.openclaw/openclaw.json for routing through billing proxy",
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "cli-proxy": {
+        "baseUrl": "http://127.0.0.1:18801",
+        "apiKey": "any-value-proxy-replaces-it",
+        "api": "anthropic-messages",
+        "models": [
+          {
+            "id": "claude-sonnet-4-6",
+            "name": "Claude Sonnet 4.6",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 8192
+          },
+          {
+            "id": "claude-opus-4-6",
+            "name": "Claude Opus 4.6",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 8192
+          },
+          {
+            "id": "claude-haiku-4-5-20251001",
+            "name": "Claude Haiku 4.5",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "cli-proxy/claude-sonnet-4-6"
+      },
+      "models": {
+        "cli-proxy/claude-sonnet-4-6": {},
+        "cli-proxy/claude-haiku-4-5-20251001": {},
+        "cli-proxy/claude-opus-4-6": {}
+      }
+    }
+  }
+}

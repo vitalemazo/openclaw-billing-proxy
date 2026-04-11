@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenClaw Billing Proxy
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ghost
+ExecStart=/usr/bin/node /opt/openclaw-billing-proxy/proxy.js --port 18801
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
