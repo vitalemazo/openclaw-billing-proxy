@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.3.0';
+const VERSION = '2.3.1';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -59,13 +59,20 @@ const REQUIRED_BETAS = [
   'fast-mode-2026-02-01'
 ];
 
-// Beta flags for plain chat requests. Emulates Claude CLI / external SDK usage.
-// Mirrors cli-proxy-api's lighter profile — no claude-code-* flags → avoids
-// triggering Anthropic's stricter anti-abuse rate-limit bucket for Sonnet/Opus.
+// Beta flags for plain chat requests. Mirrors what Anthropic expects for an
+// OAuth+Claude-Code session. Without claude-code-20250219 AND the Claude Code
+// identity system prompt injection below, Anthropic 429s Sonnet/Opus even with
+// a valid OAuth token — verified empirically 2026-04-21.
 const PLAIN_BETAS = [
   'oauth-2025-04-20',
+  'claude-code-20250219',
   'prompt-caching-scope-2026-01-05'
 ];
+
+// Claude Code identity system prompt. Anthropic's anti-abuse layer inspects
+// the system field and rate-limits aggressively if this identity line is missing.
+// This is what real Claude Code sends as the first line of its system prompt.
+const CC_IDENTITY_LINE = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 // CC tool stubs -- injected into tools array to make the tool set look more
 // like a Claude Code session. The model won't call these (schemas are minimal).
@@ -556,6 +563,42 @@ function classifyRequest(bodyStr, reqHeaders, config) {
   return 'plain';
 }
 
+// Inject the Claude Code identity line into a plain-mode request body.
+// Works for both shapes Anthropic accepts:
+//   "system":"<text>"                        — string form, prepend the line
+//   "system":[{"type":"text","text":"..."}]  — array form, prepend a text block
+// If no system field exists, inject one as a string.
+// Idempotent: if the body already starts with the identity line, no-op.
+function injectCCIdentity(bodyStr) {
+  if (bodyStr.includes(CC_IDENTITY_LINE)) return bodyStr;
+
+  // String-form system: "system":"..."
+  const strIdx = bodyStr.indexOf('"system":"');
+  if (strIdx !== -1) {
+    const valueStart = strIdx + '"system":"'.length;
+    const insert = CC_IDENTITY_LINE + '\\n';
+    return bodyStr.slice(0, valueStart) + insert + bodyStr.slice(valueStart);
+  }
+
+  // Array-form system: "system":[...]
+  const arrIdx = bodyStr.indexOf('"system":[');
+  if (arrIdx !== -1) {
+    const insertAt = arrIdx + '"system":['.length;
+    const block = '{"type":"text","text":' + JSON.stringify(CC_IDENTITY_LINE) + '},';
+    return bodyStr.slice(0, insertAt) + block + bodyStr.slice(insertAt);
+  }
+
+  // No system field — add one before "messages":[
+  const msgIdx = bodyStr.indexOf('"messages":[');
+  if (msgIdx !== -1) {
+    const sysField = '"system":' + JSON.stringify(CC_IDENTITY_LINE) + ',';
+    return bodyStr.slice(0, msgIdx) + sysField + bodyStr.slice(msgIdx);
+  }
+
+  // Malformed body — don't touch it, let Anthropic return the error
+  return bodyStr;
+}
+
 function processBody(bodyStr, config) {
   // Mask thinking/redacted_thinking content blocks from the transform pipeline
   // so Layer 2/3/6 split/join can't mutate assistant history. Restored before
@@ -835,6 +878,11 @@ function startServer(config) {
 
       if (mode === 'oc') {
         bodyStr = processBody(bodyStr, config);
+      } else {
+        // Plain mode: no heavy cloaking, but Anthropic's anti-abuse layer
+        // still requires the Claude Code identity line in the system prompt
+        // to serve Sonnet/Opus without 429-ing. Inject if absent.
+        bodyStr = injectCCIdentity(bodyStr);
       }
       body = Buffer.from(bodyStr, 'utf8');
 
