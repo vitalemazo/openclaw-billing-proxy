@@ -819,29 +819,55 @@ function startServer(config) {
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
 
-      const upstream = https.request({
-        hostname: UPSTREAM_HOST, port: 443,
-        path: req.url, method: req.method, headers
-      }, (upRes) => {
-        const status = upRes.statusCode;
-        console.log(`[${ts}] #${reqNum} > ${status}`);
-        if (status !== 200 && status !== 201) {
-          const errChunks = [];
-          upRes.on('data', c => errChunks.push(c));
-          upRes.on('end', () => {
-            let errBody = Buffer.concat(errChunks).toString();
-            if (errBody.includes('extra usage')) {
-              console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
-            }
-            errBody = reverseMap(errBody, config);
-            const nh = { ...upRes.headers };
-            delete nh['transfer-encoding']; // avoid conflict with content-length
-            nh['content-length'] = Buffer.byteLength(errBody);
-            res.writeHead(status, nh);
-            res.end(errBody);
-          });
-          return;
-        }
+      // Retry-on-401: if Anthropic rejects our token, re-read creds and retry once
+      const makeUpstreamRequest = (attemptHeaders, isRetry) => {
+        const upstream = https.request({
+          hostname: UPSTREAM_HOST, port: 443,
+          path: req.url, method: req.method, headers: attemptHeaders
+        }, (upRes) => {
+          const status = upRes.statusCode;
+          console.log(`[${ts}] #${reqNum} > ${status}${isRetry ? ' (retry)' : ''}`);
+          if (status === 401 && !isRetry) {
+            // Token rejected — force re-read credentials and retry once
+            const errChunks = [];
+            upRes.on('data', c => errChunks.push(c));
+            upRes.on('end', () => {
+              console.log(`[${ts}] #${reqNum} 401 — refreshing token and retrying...`);
+              try {
+                const freshOauth = getToken(config.credsPath);
+                const retryHeaders = { ...attemptHeaders };
+                retryHeaders['authorization'] = `Bearer ${freshOauth.accessToken}`;
+                makeUpstreamRequest(retryHeaders, true);
+              } catch (retryErr) {
+                console.error(`[${ts}] #${reqNum} retry failed: ${retryErr.message}`);
+                let errBody = Buffer.concat(errChunks).toString();
+                errBody = reverseMap(errBody, config);
+                const nh = { ...upRes.headers };
+                delete nh['transfer-encoding'];
+                nh['content-length'] = Buffer.byteLength(errBody);
+                res.writeHead(401, nh);
+                res.end(errBody);
+              }
+            });
+            return;
+          }
+          if (status !== 200 && status !== 201) {
+            const errChunks = [];
+            upRes.on('data', c => errChunks.push(c));
+            upRes.on('end', () => {
+              let errBody = Buffer.concat(errChunks).toString();
+              if (errBody.includes('extra usage')) {
+                console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
+              }
+              errBody = reverseMap(errBody, config);
+              const nh = { ...upRes.headers };
+              delete nh['transfer-encoding']; // avoid conflict with content-length
+              nh['content-length'] = Buffer.byteLength(errBody);
+              res.writeHead(status, nh);
+              res.end(errBody);
+            });
+            return;
+          }
         // SSE streaming — event-aware reverseMap. Buffer until a complete SSE
         // event arrives (terminated by \n\n), then transform per event. This
         // subsumes the older tail-buffer fix for patterns split across TCP
@@ -939,6 +965,8 @@ function startServer(config) {
       });
       upstream.write(body);
       upstream.end();
+      }; // end makeUpstreamRequest
+      makeUpstreamRequest(headers, false);
     });
   });
 
