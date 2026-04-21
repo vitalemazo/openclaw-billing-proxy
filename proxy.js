@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.3';
+const VERSION = '2.3.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -47,7 +47,7 @@ const BILLING_HASH_INDICES = [4, 7, 20];
 const DEVICE_ID = crypto.randomBytes(32).toString('hex');
 const INSTANCE_SESSION_ID = crypto.randomUUID();
 
-// Beta flags required for OAuth + Claude Code features
+// Beta flags for OpenClaw-flavored (full cloak) requests. Emulates Claude Code.
 const REQUIRED_BETAS = [
   'oauth-2025-04-20',
   'claude-code-20250219',
@@ -57,6 +57,14 @@ const REQUIRED_BETAS = [
   'prompt-caching-scope-2026-01-05',
   'effort-2025-11-24',
   'fast-mode-2026-02-01'
+];
+
+// Beta flags for plain chat requests. Emulates Claude CLI / external SDK usage.
+// Mirrors cli-proxy-api's lighter profile — no claude-code-* flags → avoids
+// triggering Anthropic's stricter anti-abuse rate-limit bucket for Sonnet/Opus.
+const PLAIN_BETAS = [
+  'oauth-2025-04-20',
+  'prompt-caching-scope-2026-01-05'
 ];
 
 // CC tool stubs -- injected into tools array to make the tool set look more
@@ -517,6 +525,37 @@ function unmaskThinkingBlocks(m, masks) {
 }
 
 // ─── Request Processing ─────────────────────────────────────────────────────
+// ─── Context-aware cloaking gate ────────────────────────────────────────────
+// Two request classes, two cloaking depths:
+//   - 'oc':    OpenClaw-flavored agent requests. Full 7-layer cloak.
+//   - 'plain': generic /v1/messages or /v1/chat/completions. Headers only,
+//              no body transforms, no claude-code-* beta flags. Mimics
+//              cli-proxy-api / Claude CLI. Avoids Anthropic's anti-abuse
+//              scoring on Sonnet/Opus that 429s on heavy cloaking.
+// Default is 'plain' (safe). Callers opt into 'oc' via X-Cloak-Mode header
+// or by presence of OC-specific markers in the request body.
+function classifyRequest(bodyStr, reqHeaders, config) {
+  // Explicit header override wins
+  const m = (reqHeaders['x-cloak-mode'] || '').toLowerCase();
+  if (m === 'oc' || m === 'openclaw') return 'oc';
+  if (m === 'plain' || m === 'cli') return 'plain';
+
+  // Auto-detect OC-flavored requests by looking for signal markers that
+  // only appear in OpenClaw agent traffic.
+  if (bodyStr.includes('You are a personal assistant')) return 'oc';
+  if (bodyStr.includes('sessions_spawn')) return 'oc';
+
+  // Any OC-specific tool name in the body → OC mode.
+  if (config && Array.isArray(config.toolRenames)) {
+    for (const pair of config.toolRenames) {
+      const ocName = pair[0];
+      if (ocName && bodyStr.indexOf('"' + ocName + '"') !== -1) return 'oc';
+    }
+  }
+
+  return 'plain';
+}
+
 function processBody(bodyStr, config) {
   // Mask thinking/redacted_thinking content blocks from the transform pipeline
   // so Layer 2/3/6 split/join can't mutate assistant history. Restored before
@@ -789,7 +828,14 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
-      bodyStr = processBody(bodyStr, config);
+
+      // Classify request BEFORE mutating the body so we see it as the caller sent it.
+      // Strip X-Cloak-Mode header regardless of mode (never forward to Anthropic).
+      const mode = classifyRequest(bodyStr, req.headers, config);
+
+      if (mode === 'oc') {
+        bodyStr = processBody(bodyStr, config);
+      }
       body = Buffer.from(bodyStr, 'utf8');
 
       const headers = {};
@@ -797,7 +843,8 @@ function startServer(config) {
         const lk = key.toLowerCase();
         if (lk === 'host' || lk === 'connection' || lk === 'authorization' ||
             lk === 'x-api-key' || lk === 'content-length' ||
-            lk === 'x-session-affinity') continue; // strip non-CC headers
+            lk === 'x-cloak-mode' ||
+            lk === 'x-session-affinity') continue; // strip non-CC / internal headers
         headers[key] = value;
       }
       headers['authorization'] = `Bearer ${oauth.accessToken}`;
@@ -805,19 +852,39 @@ function startServer(config) {
       headers['accept-encoding'] = 'identity';
       headers['anthropic-version'] = '2023-06-01';
 
-      // Inject Stainless SDK + Claude Code identity headers
-      const ccHeaders = getStainlessHeaders();
-      for (const [k, v] of Object.entries(ccHeaders)) {
-        headers[k] = v;
+      if (mode === 'oc') {
+        // Full Claude Code emulation — headers + beta flags + Stainless identity
+        const ccHeaders = getStainlessHeaders();
+        for (const [k, v] of Object.entries(ccHeaders)) headers[k] = v;
+
+        const existingBeta = headers['anthropic-beta'] || '';
+        const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
+        for (const b of REQUIRED_BETAS) if (!betas.includes(b)) betas.push(b);
+        headers['anthropic-beta'] = betas.join(',');
+      } else {
+        // Plain mode: emulate claude-cli (external SDK user). Match cli-proxy-api
+        // style — avoids Anthropic's Claude-Code-specific anti-abuse scoring.
+        headers['user-agent'] = 'claude-cli/2.1.63 (external, sdk-cli)';
+        // Drop any CC-specific headers the caller may have sent
+        delete headers['x-stainless-lang'];
+        delete headers['x-stainless-package-version'];
+        delete headers['x-stainless-runtime'];
+        delete headers['x-stainless-runtime-version'];
+        delete headers['x-stainless-arch'];
+        delete headers['x-stainless-os'];
+        delete headers['x-stainless-retry-count'];
+        delete headers['x-stainless-timeout'];
+
+        const existingBeta = headers['anthropic-beta'] || '';
+        const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
+        for (const b of PLAIN_BETAS) if (!betas.includes(b)) betas.push(b);
+        // Strip any claude-code-* betas the caller sent
+        const filtered = betas.filter(b => !b.startsWith('claude-code-'));
+        headers['anthropic-beta'] = filtered.join(',');
       }
 
-      const existingBeta = headers['anthropic-beta'] || '';
-      const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
-      for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
-      headers['anthropic-beta'] = betas.join(',');
-
       const ts = new Date().toISOString().substring(11, 19);
-      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
+      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} [${mode}] (${originalSize}b -> ${body.length}b)`);
 
       // Retry-on-401: if Anthropic rejects our token, re-read creds and retry once
       const makeUpstreamRequest = (attemptHeaders, isRetry) => {
