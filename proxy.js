@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.3.1';
+const VERSION = '2.4.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -599,6 +599,141 @@ function injectCCIdentity(bodyStr) {
   return bodyStr;
 }
 
+// ─── OpenAI-compat /v1/chat/completions ↔ Anthropic /v1/messages translation ─
+// Anthropic treats /v1/chat/completions with OAuth more strictly than
+// /v1/messages (429 rate_limit_error on Sonnet/Opus even with valid creds).
+// cli-proxy-api avoids this by translating OpenAI-format requests into
+// Anthropic-native and forwarding to /v1/messages. Billing-proxy now does
+// the same, letting us retire cli-proxy-api.
+//
+// Phase 1: non-streaming only. Streaming requests are rejected with 501
+// until Phase 2 adds SSE event-level translation.
+function isOpenAIChatCompletions(urlPath) {
+  return urlPath === '/v1/chat/completions' ||
+         urlPath.startsWith('/v1/chat/completions?');
+}
+
+// OpenAI chat-completions request body → Anthropic messages body (JSON strings).
+// Returns { body: string, model: string } or throws on malformed input.
+function openaiToAnthropicRequest(bodyStr) {
+  const req = JSON.parse(bodyStr);
+  const out = {
+    model: req.model,
+    max_tokens: req.max_tokens || 4096
+  };
+
+  // Direct pass-through fields
+  if (typeof req.temperature === 'number') out.temperature = req.temperature;
+  if (typeof req.top_p === 'number') out.top_p = req.top_p;
+  if (req.stream === true) out.stream = true;
+  if (req.stop !== undefined) {
+    out.stop_sequences = Array.isArray(req.stop) ? req.stop : [req.stop];
+  }
+
+  // Split messages: system rows float to top-level system field; rest stay.
+  const messages = Array.isArray(req.messages) ? req.messages : [];
+  const systemParts = [];
+  const kept = [];
+  for (const m of messages) {
+    if (m.role === 'system') {
+      if (typeof m.content === 'string') systemParts.push(m.content);
+      else if (Array.isArray(m.content)) {
+        for (const p of m.content) {
+          if (p && typeof p === 'object' && typeof p.text === 'string') systemParts.push(p.text);
+        }
+      }
+    } else {
+      kept.push(m);
+    }
+  }
+  if (systemParts.length > 0) out.system = systemParts.join('\n\n');
+  out.messages = kept;
+
+  // Tools: OpenAI wraps each in {type:'function', function:{name, description, parameters}}.
+  // Anthropic expects flat {name, description, input_schema}.
+  if (Array.isArray(req.tools)) {
+    out.tools = req.tools.map(t => {
+      if (t && t.type === 'function' && t.function) {
+        return {
+          name: t.function.name,
+          description: t.function.description || '',
+          input_schema: t.function.parameters || { type: 'object', properties: {} }
+        };
+      }
+      return t;
+    });
+  }
+  if (req.tool_choice !== undefined) {
+    // OpenAI's "auto"/"none"/{type:"function",function:{name:...}} → Anthropic's
+    // {type:"auto"|"any"|"tool", name?:...}
+    const tc = req.tool_choice;
+    if (tc === 'auto') out.tool_choice = { type: 'auto' };
+    else if (tc === 'required') out.tool_choice = { type: 'any' };
+    else if (tc === 'none') { /* no tool_choice; dropping tools is implicit */ }
+    else if (typeof tc === 'object' && tc.type === 'function' && tc.function) {
+      out.tool_choice = { type: 'tool', name: tc.function.name };
+    }
+  }
+
+  return { body: JSON.stringify(out), model: out.model, stream: !!out.stream };
+}
+
+// Anthropic messages response body → OpenAI chat-completion response (JSON strings).
+function anthropicToOpenAIResponse(respBodyStr, modelName) {
+  let resp;
+  try { resp = JSON.parse(respBodyStr); } catch (e) { return respBodyStr; }
+  if (!resp || resp.error) return respBodyStr; // passthrough errors unchanged
+
+  const contentBlocks = Array.isArray(resp.content) ? resp.content : [];
+  const textContent = contentBlocks
+    .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+    .map(b => b.text)
+    .join('');
+
+  const toolBlocks = contentBlocks.filter(b => b && b.type === 'tool_use');
+  const toolCalls = toolBlocks.map(t => ({
+    id: t.id,
+    type: 'function',
+    function: {
+      name: t.name,
+      arguments: typeof t.input === 'string' ? t.input : JSON.stringify(t.input || {})
+    }
+  }));
+
+  const finishMap = {
+    end_turn: 'stop',
+    max_tokens: 'length',
+    stop_sequence: 'stop',
+    tool_use: 'tool_calls',
+    pause_turn: 'stop'
+  };
+  const finishReason = finishMap[resp.stop_reason] || 'stop';
+
+  const message = { role: 'assistant', content: textContent || null };
+  if (toolCalls.length > 0) message.tool_calls = toolCalls;
+
+  const inTok = (resp.usage && resp.usage.input_tokens) || 0;
+  const outTok = (resp.usage && resp.usage.output_tokens) || 0;
+
+  const out = {
+    id: resp.id,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: resp.model || modelName,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: finishReason
+    }],
+    usage: {
+      prompt_tokens: inTok,
+      completion_tokens: outTok,
+      total_tokens: inTok + outTok
+    }
+  };
+  return JSON.stringify(out);
+}
+
 function processBody(bodyStr, config) {
   // Mask thinking/redacted_thinking content blocks from the transform pipeline
   // so Layer 2/3/6 split/join can't mutate assistant history. Restored before
@@ -872,6 +1007,44 @@ function startServer(config) {
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
 
+      // OpenAI chat-completions translation (Phase 1 — non-streaming only).
+      // Rewrites the request body from OpenAI shape to Anthropic native AND
+      // rewrites the URL path so it forwards to /v1/messages (which has a
+      // cleaner rate-limit bucket for OAuth sessions).
+      let upstreamPath = req.url;
+      let translateResponse = false;
+      let responseModelName = null;
+      if (isOpenAIChatCompletions(req.url) && (req.method === 'POST' || req.method === 'post')) {
+        try {
+          const translated = openaiToAnthropicRequest(bodyStr);
+          if (translated.stream) {
+            // Phase 2 will handle SSE event-level translation. For now, reject.
+            res.writeHead(501, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              error: {
+                message: 'Streaming via /v1/chat/completions is not yet supported by this proxy. Send non-streaming, or call /v1/messages directly.',
+                type: 'not_implemented_error',
+                code: 'streaming_not_supported'
+              }
+            }));
+            return;
+          }
+          bodyStr = translated.body;
+          upstreamPath = '/v1/messages';
+          responseModelName = translated.model;
+          translateResponse = true;
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: {
+              message: 'Invalid /v1/chat/completions request: ' + e.message,
+              type: 'invalid_request_error'
+            }
+          }));
+          return;
+        }
+      }
+
       // Classify request BEFORE mutating the body so we see it as the caller sent it.
       // Strip X-Cloak-Mode header regardless of mode (never forward to Anthropic).
       const mode = classifyRequest(bodyStr, req.headers, config);
@@ -932,13 +1105,13 @@ function startServer(config) {
       }
 
       const ts = new Date().toISOString().substring(11, 19);
-      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} [${mode}] (${originalSize}b -> ${body.length}b)`);
+      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} [${mode}${translateResponse ? ":oai2a" : ""}] (${originalSize}b -> ${body.length}b)`);
 
       // Retry-on-401: if Anthropic rejects our token, re-read creds and retry once
       const makeUpstreamRequest = (attemptHeaders, isRetry) => {
         const upstream = https.request({
           hostname: UPSTREAM_HOST, port: 443,
-          path: req.url, method: req.method, headers: attemptHeaders
+          path: upstreamPath, method: req.method, headers: attemptHeaders
         }, (upRes) => {
           const status = upRes.statusCode;
           console.log(`[${ts}] #${reqNum} > ${status}${isRetry ? ' (retry)' : ''}`);
@@ -1063,6 +1236,11 @@ function startServer(config) {
             // enforces byte-equality on the latest assistant message.
             const { masked: rMasked, masks: rMasks } = maskThinkingBlocks(respBody);
             respBody = unmaskThinkingBlocks(reverseMap(rMasked, config), rMasks);
+            // If the caller hit /v1/chat/completions we translated upstream;
+            // now translate the Anthropic response shape back to OpenAI shape.
+            if (translateResponse) {
+              respBody = anthropicToOpenAIResponse(respBody, responseModelName);
+            }
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(respBody);
