@@ -14,17 +14,17 @@
 
 set -euo pipefail
 
+# Source env file FIRST so VAULT_ROLE_ID / VAULT_SECRET_ID are in scope.
+if [ -f /boot/config/custom/oauth-to-vault.env ]; then
+  # shellcheck disable=SC1091
+  . /boot/config/custom/oauth-to-vault.env
+fi
+
 VAULT_ADDR="${VAULT_ADDR:-http://10.0.3.75:8200}"
 ROLE_ID="${VAULT_ROLE_ID:-}"
 SECRET_ID="${VAULT_SECRET_ID:-}"
 VAULT_PATH="${VAULT_PATH:-secret/data/openclaw/claude-oauth}"
 CRED_FILE="${CRED_FILE:-/mnt/user/appdata/cli-proxy-api/auth/claude-vitalemazo@gmail.com.json}"
-
-# Load creds from environment or from /boot/config/custom/oauth-to-vault.env
-if [ -z "$ROLE_ID" ] && [ -f /boot/config/custom/oauth-to-vault.env ]; then
-  # shellcheck disable=SC1091
-  . /boot/config/custom/oauth-to-vault.env
-fi
 
 if [ -z "$ROLE_ID" ] || [ -z "$SECRET_ID" ]; then
   echo "[$(date)] FATAL: VAULT_ROLE_ID / VAULT_SECRET_ID not set" >&2
