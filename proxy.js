@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.6.0';
+const VERSION = '2.7.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -433,6 +433,22 @@ function loadConfig() {
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
+// Anthropic OAuth refresh endpoint (Claude Code's public client_id — same one
+// cli-proxy-api uses). v2.7 adds optional internal refresh so billing-proxy
+// can rotate tokens on its own and we can retire cli-proxy-api's refresh job.
+// Gated by BILLING_PROXY_AUTOREFRESH=true; OFF by default so enabling is an
+// explicit migration step (two refreshers racing the single-use refresh token
+// would cause invalidations — only one side should refresh at a time).
+const ANTHROPIC_TOKEN_URL = 'https://api.anthropic.com/v1/oauth/token';
+const ANTHROPIC_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+
+// In-memory token cache. When auto-refresh is on and we successfully rotate,
+// we keep the new token here (the mounted creds file is Secret-backed and
+// ESO-owned, so we cannot write back without fighting the sync loop).
+let runtimeToken = null; // {accessToken, refreshToken, expiresAt, subscriptionType, source}
+let refreshInFlight = false;
+const refreshStats = { attempts: 0, successes: 0, failures: 0, lastError: null, lastSuccessAt: null };
+
 function getToken(credsPath) {
   // Env var mode: return synthetic OAuth object without file I/O
   if (credsPath === 'env') {
@@ -445,7 +461,215 @@ function getToken(credsPath) {
   const creds = JSON.parse(raw);
   const oauth = creds.claudeAiOauth;
   if (!oauth || !oauth.accessToken) throw new Error('No OAuth token. Run "claude auth login".');
+
+  // If auto-refresh has produced a newer in-memory token, prefer it. This
+  // lets billing-proxy serve traffic with its freshly-rotated access_token
+  // without waiting for ESO to sync Vault → Secret → filesystem (which adds
+  // minutes of lag and we'd keep hitting 401s in the meantime).
+  if (runtimeToken && runtimeToken.accessToken &&
+      runtimeToken.expiresAt > (oauth.expiresAt || 0)) {
+    return { ...oauth, accessToken: runtimeToken.accessToken,
+             expiresAt: runtimeToken.expiresAt, source: 'runtime-refresh' };
+  }
   return oauth;
+}
+
+// POST to Anthropic's OAuth refresh endpoint. Returns the full JSON response
+// or throws. Single-use refresh tokens: every success returns a NEW refresh
+// token that invalidates the one we just used. Callers must persist it.
+function refreshAnthropicToken(refreshToken) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = JSON.stringify({
+      client_id: ANTHROPIC_OAUTH_CLIENT_ID,
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken
+    });
+    const url = new URL(ANTHROPIC_TOKEN_URL);
+    const req = https.request({
+      method: 'POST',
+      hostname: url.hostname,
+      port: 443,
+      path: url.pathname,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Content-Length': Buffer.byteLength(bodyStr),
+        'User-Agent': `openclaw-billing-proxy/${VERSION} (oauth-refresh)`
+      }
+    }, (resp) => {
+      const chunks = [];
+      resp.on('data', c => chunks.push(c));
+      resp.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (resp.statusCode < 200 || resp.statusCode >= 300) {
+          return reject(new Error(`refresh HTTP ${resp.statusCode}: ${raw.slice(0, 200)}`));
+        }
+        try {
+          const data = JSON.parse(raw);
+          if (!data.access_token || !data.refresh_token) {
+            return reject(new Error('refresh response missing tokens'));
+          }
+          resolve(data);
+        } catch (e) { reject(new Error('refresh response not JSON: ' + e.message)); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(new Error('refresh timeout')); });
+    req.write(bodyStr);
+    req.end();
+  });
+}
+
+// Decide whether to refresh now. Threshold: if the current access token has
+// less than REFRESH_LEAD_MS left before expiry, rotate. Default 60 min gives
+// a comfortable window vs. the typical 8h token lifetime, and avoids thrashing.
+const REFRESH_LEAD_MS = parseInt(process.env.BILLING_PROXY_REFRESH_LEAD_MS || '3600000', 10);
+const REFRESH_INTERVAL_MS = parseInt(process.env.BILLING_PROXY_REFRESH_INTERVAL_MS || '300000', 10);
+
+async function maybeRefresh(credsPath) {
+  if (refreshInFlight) return;
+  if (credsPath === 'env') return; // env-var mode has no refresh token
+  refreshInFlight = true;
+  try {
+    const current = getToken(credsPath);
+    const msToExpiry = (current.expiresAt || 0) - Date.now();
+    if (msToExpiry > REFRESH_LEAD_MS) return; // still fresh enough
+    const raw = fs.readFileSync(credsPath, 'utf8');
+    const creds = JSON.parse(raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw);
+    const rt = creds.claudeAiOauth && creds.claudeAiOauth.refreshToken;
+    if (!rt) { refreshStats.lastError = 'no refresh_token in creds file'; return; }
+    refreshStats.attempts++;
+    console.log(`[REFRESH] access token expires in ${(msToExpiry/60000).toFixed(1)}min, rotating...`);
+    const data = await refreshAnthropicToken(rt);
+    const newExpiresAt = Date.now() + (data.expires_in * 1000);
+    runtimeToken = {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token,
+      expiresAt: newExpiresAt,
+      subscriptionType: current.subscriptionType,
+      source: 'runtime-refresh'
+    };
+    refreshStats.successes++;
+    refreshStats.lastSuccessAt = new Date().toISOString();
+    refreshStats.lastError = null;
+    const hours = ((newExpiresAt - Date.now()) / 3600000).toFixed(1);
+    // Persist to Vault so ESO re-syncs the same values back and pod restarts
+    // don't reuse an already-rotated refresh_token (which would 400 and brick
+    // us). Best-effort: if Vault write fails we still keep the fresh token
+    // in memory and serve traffic — operator can see failure in /health and
+    // logs. Next refresh cycle will try again.
+    if (vaultEnabled()) {
+      try {
+        await vaultWriteCredentials(runtimeToken, creds.claudeAiOauth);
+        refreshStats.lastVaultWriteAt = new Date().toISOString();
+        console.log(`[REFRESH] rotated + persisted to Vault. new token expires in ${hours}h.`);
+      } catch (vaultErr) {
+        refreshStats.lastVaultError = vaultErr.message;
+        console.error(`[REFRESH] rotated OK but Vault write-back FAILED: ${vaultErr.message}. Token valid in-memory only until ESO sync catches up or pod restarts.`);
+      }
+    } else {
+      console.log(`[REFRESH] rotated. new token expires in ${hours}h (in-memory only; Vault write-back disabled).`);
+    }
+  } catch (e) {
+    refreshStats.failures++;
+    refreshStats.lastError = e.message;
+    console.error(`[REFRESH] failed: ${e.message}`);
+  } finally {
+    refreshInFlight = false;
+  }
+}
+
+// Vault write-back — required once cli-proxy-api is retired, otherwise a pod
+// restart after the refresh_token rotates would re-read a stale file from the
+// ESO-synced Secret and brick the pod (single-use refresh tokens). If VAULT_*
+// env vars are present we log in with AppRole, PUT the new creds to KV v2,
+// and ESO eventually re-syncs the same values back down — Vault is the source
+// of truth. If Vault write-back is disabled, refresh is in-memory only and
+// relies on cli-proxy-api (or manual bootstrap) for persistence.
+const VAULT_ADDR = process.env.VAULT_ADDR || '';
+const VAULT_ROLE_ID = process.env.VAULT_ROLE_ID || '';
+const VAULT_SECRET_ID = process.env.VAULT_SECRET_ID || '';
+const VAULT_KV_PATH = process.env.VAULT_KV_PATH || 'secret/data/openclaw/claude-oauth';
+const VAULT_KV_KEY = process.env.VAULT_KV_KEY || 'credentials';
+const vaultEnabled = () => Boolean(VAULT_ADDR && VAULT_ROLE_ID && VAULT_SECRET_ID);
+
+function vaultRequest(method, pathOnly, bodyObj, token) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(VAULT_ADDR + pathOnly);
+    const isHttps = url.protocol === 'https:';
+    const lib = isHttps ? https : http;
+    const bodyStr = bodyObj ? JSON.stringify(bodyObj) : '';
+    const headers = { 'Accept': 'application/json' };
+    if (bodyStr) { headers['Content-Type'] = 'application/json';
+                   headers['Content-Length'] = Buffer.byteLength(bodyStr); }
+    if (token) headers['X-Vault-Token'] = token;
+    const req = lib.request({
+      method, hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search, headers
+    }, (resp) => {
+      const chunks = [];
+      resp.on('data', c => chunks.push(c));
+      resp.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (resp.statusCode < 200 || resp.statusCode >= 300) {
+          return reject(new Error(`vault ${method} ${pathOnly} HTTP ${resp.statusCode}: ${raw.slice(0,200)}`));
+        }
+        try { resolve(raw ? JSON.parse(raw) : {}); }
+        catch (e) { reject(new Error('vault response not JSON: ' + e.message)); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(new Error('vault request timeout')); });
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
+async function vaultLogin() {
+  const data = await vaultRequest('POST', '/v1/auth/approle/login',
+    { role_id: VAULT_ROLE_ID, secret_id: VAULT_SECRET_ID }, null);
+  if (!data || !data.auth || !data.auth.client_token) {
+    throw new Error('vault AppRole login returned no token');
+  }
+  return data.auth.client_token;
+}
+
+// Write the rotated creds back to Vault so ESO → Secret → file stays coherent
+// across pod restarts. Preserves subscriptionType and any other fields in the
+// existing record.
+async function vaultWriteCredentials(newOauth, existingOauth) {
+  const token = await vaultLogin();
+  const merged = {
+    ...existingOauth,
+    accessToken: newOauth.accessToken,
+    refreshToken: newOauth.refreshToken,
+    expiresAt: newOauth.expiresAt
+  };
+  const payload = {
+    data: {
+      [VAULT_KV_KEY]: JSON.stringify({ claudeAiOauth: merged })
+    }
+  };
+  await vaultRequest('POST', '/v1/' + VAULT_KV_PATH, payload, token);
+}
+
+function startAutoRefresh(credsPath) {
+  if (process.env.BILLING_PROXY_AUTOREFRESH !== 'true') {
+    console.log('[REFRESH] auto-refresh DISABLED (set BILLING_PROXY_AUTOREFRESH=true to enable).');
+    return;
+  }
+  if (credsPath === 'env') {
+    console.log('[REFRESH] auto-refresh not applicable in OAUTH_TOKEN env-var mode.');
+    return;
+  }
+  const vaultMsg = vaultEnabled()
+    ? `Vault write-back ENABLED (${VAULT_ADDR} ${VAULT_KV_PATH})`
+    : 'Vault write-back DISABLED (in-memory only — pod restart will re-read file)';
+  console.log(`[REFRESH] auto-refresh ENABLED. Check interval: ${REFRESH_INTERVAL_MS/1000}s, lead time: ${REFRESH_LEAD_MS/60000}min. ${vaultMsg}.`);
+  // Fire once on startup (after server is listening) then every interval
+  setTimeout(() => maybeRefresh(credsPath), 10000);
+  setInterval(() => maybeRefresh(credsPath), REFRESH_INTERVAL_MS);
 }
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
@@ -1069,6 +1293,12 @@ function startServer(config) {
             ccToolStubs: config.injectCCStubs ? CC_TOOL_STUBS.length : 0,
             systemStripEnabled: config.stripSystemConfig,
             descriptionStripEnabled: config.stripToolDescriptions
+          },
+          refresh: {
+            enabled: process.env.BILLING_PROXY_AUTOREFRESH === 'true',
+            vaultWriteBack: vaultEnabled(),
+            tokenSource: oauth.source || 'file',
+            stats: refreshStats
           }
         }));
       } catch (e) {
@@ -1356,6 +1586,7 @@ function startServer(config) {
       console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://${bindHost}:${config.port}\n`);
+      startAutoRefresh(config.credsPath);
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
     }
