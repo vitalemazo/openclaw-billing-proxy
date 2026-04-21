@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.5.0';
+const VERSION = '2.6.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -734,6 +734,94 @@ function anthropicToOpenAIResponse(respBodyStr, modelName) {
   return JSON.stringify(out);
 }
 
+// ─── Anthropic SSE → OpenAI chat.completion.chunk stream ────────────────────
+// Phase 2 of the OpenAI-compat translator. Anthropic streams discrete events
+// (message_start, content_block_delta with text_delta, message_delta with
+// stop_reason, message_stop). OpenAI clients expect data: {object:
+// 'chat.completion.chunk', choices:[{delta:{content:'...'}}]} frames followed
+// by `data: [DONE]`. This function converts per event.
+//
+// Stateful — the returned closure remembers the stream id/model so every chunk
+// carries them. Call once per /v1/chat/completions streaming request.
+function makeOpenAISSETransformer(initialModel) {
+  const state = {
+    id: 'chatcmpl-' + crypto.randomBytes(12).toString('hex'),
+    model: initialModel || 'unknown',
+    created: Math.floor(Date.now() / 1000),
+    roleEmitted: false
+  };
+
+  const chunk = (delta, finishReason) => {
+    const obj = {
+      id: state.id,
+      object: 'chat.completion.chunk',
+      created: state.created,
+      model: state.model,
+      choices: [{
+        index: 0,
+        delta: delta || {},
+        finish_reason: finishReason || null
+      }]
+    };
+    return 'data: ' + JSON.stringify(obj) + '\n\n';
+  };
+
+  return (event) => {
+    // Parse the data: line out of a whole SSE event ("event: foo\ndata: {...}\n\n")
+    const dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
+    if (dataIdx === -1) return '';
+    const dataStart = (dataIdx > 0 ? dataIdx + 1 : 0) + 'data: '.length;
+    const nl = event.indexOf('\n', dataStart);
+    const dataStr = nl === -1 ? event.slice(dataStart) : event.slice(dataStart, nl);
+
+    let data;
+    try { data = JSON.parse(dataStr); } catch (_) { return ''; }
+
+    const type = data.type;
+
+    if (type === 'message_start') {
+      const msg = data.message || {};
+      if (msg.id) state.id = msg.id;
+      if (msg.model) state.model = msg.model;
+      // Emit initial chunk with role — many OpenAI clients (incl. openai-python)
+      // expect the role to appear in the first delta.
+      state.roleEmitted = true;
+      return chunk({ role: 'assistant', content: '' });
+    }
+
+    if (type === 'content_block_delta') {
+      const d = data.delta || {};
+      if (d.type === 'text_delta' && typeof d.text === 'string') {
+        return chunk({ content: d.text });
+      }
+      // Tool-call streaming (input_json_delta) not yet supported — swallow.
+      // OpenAI clients that need streamed tool_calls will see no output for
+      // tool blocks; callers needing that should use /v1/messages native.
+      return '';
+    }
+
+    if (type === 'message_delta') {
+      const sr = data.delta && data.delta.stop_reason;
+      if (sr) {
+        const finishMap = {
+          end_turn: 'stop',
+          max_tokens: 'length',
+          stop_sequence: 'stop',
+          tool_use: 'tool_calls',
+          pause_turn: 'stop'
+        };
+        return chunk({}, finishMap[sr] || 'stop');
+      }
+      return '';
+    }
+
+    if (type === 'message_stop') return 'data: [DONE]\n\n';
+
+    // content_block_start / content_block_stop / ping / error / others — skip.
+    return '';
+  };
+}
+
 function processBody(bodyStr, config) {
   // Mask thinking/redacted_thinking content blocks from the transform pipeline
   // so Layer 2/3/6 split/join can't mutate assistant history. Restored before
@@ -1013,26 +1101,16 @@ function startServer(config) {
       // cleaner rate-limit bucket for OAuth sessions).
       let upstreamPath = req.url;
       let translateResponse = false;
+      let translateSSE = false;
       let responseModelName = null;
       if (isOpenAIChatCompletions(req.url) && (req.method === 'POST' || req.method === 'post')) {
         try {
           const translated = openaiToAnthropicRequest(bodyStr);
-          if (translated.stream) {
-            // Phase 2 will handle SSE event-level translation. For now, reject.
-            res.writeHead(501, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              error: {
-                message: 'Streaming via /v1/chat/completions is not yet supported by this proxy. Send non-streaming, or call /v1/messages directly.',
-                type: 'not_implemented_error',
-                code: 'streaming_not_supported'
-              }
-            }));
-            return;
-          }
           bodyStr = translated.body;
           upstreamPath = '/v1/messages';
           responseModelName = translated.model;
           translateResponse = true;
+          if (translated.stream) translateSSE = true;
         } catch (e) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
@@ -1152,35 +1230,52 @@ function startServer(config) {
           let pending = '';
           let currentBlockIsThinking = false;
 
+          // If this request started as /v1/chat/completions, translate each
+          // Anthropic SSE event into an OpenAI chat.completion.chunk frame.
+          // Stateful (carries stream id/model/created) so every chunk is
+          // consistent.
+          const openaiTransform = translateSSE ? makeOpenAISSETransformer(responseModelName) : null;
+
           const transformEvent = (event) => {
+            // OC reverseMap first (on the Anthropic-shaped event), THEN re-shape
+            // to OpenAI stream format if the caller hit /v1/chat/completions.
+            // Order matters: openaiTransform expects Anthropic-schema JSON.
+            // reverseMap's toolRename / propRename / string-replace substitutions
+            // happen on the JSON string, so they're safe to apply first.
+
             // Locate the data: line (always at the start of an SSE line)
             let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
-            if (dataIdx === -1) return reverseMap(event, config);
+            if (dataIdx === -1) return openaiTransform ? '' : reverseMap(event, config);
             if (dataIdx > 0) dataIdx += 1; // skip the leading \n
             const dataLineEnd = event.indexOf('\n', dataIdx + 6);
             const dataStr = dataLineEnd === -1
               ? event.slice(dataIdx + 6)
               : event.slice(dataIdx + 6, dataLineEnd);
 
+            let ocTransformed;
             if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
               if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
                   dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
                 currentBlockIsThinking = true;
-                return event; // pass through unchanged
+                ocTransformed = event;                     // pass through unchanged
+              } else {
+                currentBlockIsThinking = false;
+                ocTransformed = reverseMap(event, config);
               }
-              currentBlockIsThinking = false;
-              return reverseMap(event, config);
-            }
-            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
+            } else if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
               const wasThinking = currentBlockIsThinking;
               currentBlockIsThinking = false;
-              return wasThinking ? event : reverseMap(event, config);
+              ocTransformed = wasThinking ? event : reverseMap(event, config);
+            } else if (currentBlockIsThinking) {
+              ocTransformed = event;                       // thinking_delta etc.
+            } else {
+              ocTransformed = reverseMap(event, config);
             }
-            if (currentBlockIsThinking) {
-              // thinking_delta / signature_delta / etc. inside a thinking block
-              return event;
+
+            if (openaiTransform) {
+              return openaiTransform(ocTransformed);
             }
-            return reverseMap(event, config);
+            return ocTransformed;
           };
 
           upRes.on('data', (chunk) => {
