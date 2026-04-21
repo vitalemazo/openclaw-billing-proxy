@@ -48,10 +48,35 @@ if [ -z "$TOKEN" ]; then
   exit 4
 fi
 
-# 2. Pack the creds file as Vault KV-v2 data payload.
-#    Vault wants {"data": {<key>: <value>}}. We put the RAW json under key
-#    'credentials' so the consumer can mount it verbatim.
-PAYLOAD=$(jq -Rs '{data: {credentials: .}}' < "$CRED_FILE")
+# 2. Transform cli-proxy-api's flat schema to Claude CLI's nested shape that
+#    openclaw-billing-proxy reads. See /opt/sync-claude-auth.sh on DGX for
+#    the reference transform: billing-proxy reads creds.claudeAiOauth.{
+#    accessToken, refreshToken, expiresAt } — the raw Tower file only has
+#    flat snake_case fields. Without this transform, proxy.js logs
+#    'No OAuth token. Run "claude auth login"' and refuses to start.
+#
+# expiresAt: epoch milliseconds. Tower stores `expired` as ISO8601 with a
+# +HH:MM offset ("2026-04-22T07:27:24+08:00") which jq's fromdateiso8601
+# can't parse (it wants Z). Use `date -d` which accepts both.
+ACCESS=$(jq -r '.access_token' < "$CRED_FILE")
+REFRESH=$(jq -r '.refresh_token' < "$CRED_FILE")
+EXPIRED_ISO=$(jq -r '.expired' < "$CRED_FILE")
+SUB_TYPE=$(jq -r '.type // "max"' < "$CRED_FILE")
+EXPIRES_MS=$(date -d "$EXPIRED_ISO" +%s%3N)
+
+if [ -z "$ACCESS" ] || [ -z "$REFRESH" ] || [ -z "$EXPIRES_MS" ] || [ "$EXPIRES_MS" = "" ]; then
+  echo "[$(date)] FATAL: could not extract tokens from $CRED_FILE" >&2
+  exit 6
+fi
+
+CC_FORMAT=$(jq -nc \
+  --arg access "$ACCESS" --arg refresh "$REFRESH" --arg sub "$SUB_TYPE" \
+  --argjson expires "$EXPIRES_MS" \
+  '{claudeAiOauth: {accessToken: $access, refreshToken: $refresh, expiresAt: $expires, subscriptionType: $sub}}')
+
+# Pack for Vault KV-v2 write: { data: { credentials: "<json-string>" } }.
+# We store as a string so the pod mounts it verbatim as a single file.
+PAYLOAD=$(echo "$CC_FORMAT" | jq -Rs '{data: {credentials: .}}')
 
 # 3. Write to Vault. Merge with any existing keys at the path.
 HTTP_CODE=$(curl -s -o /tmp/oauth-to-vault.resp -w '%{http_code}' \
