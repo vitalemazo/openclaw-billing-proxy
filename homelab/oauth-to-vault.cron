@@ -1,0 +1,8 @@
+# /etc/cron.d/oauth-to-vault — sync fresh Claude OAuth creds to Vault every 10 min
+# Install with: cp homelab/oauth-to-vault.cron /etc/cron.d/ && chmod 644 /etc/cron.d/oauth-to-vault.cron
+# Requires: /boot/config/custom/oauth-to-vault.env with VAULT_ROLE_ID + VAULT_SECRET_ID
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+*/10 * * * * root /boot/config/custom/oauth-to-vault.sh >> /var/log/oauth-to-vault.log 2>&1
