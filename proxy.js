@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.7.0';
+const VERSION = '2.8.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -46,6 +46,116 @@ const BILLING_HASH_INDICES = [4, 7, 20];
 // Persistent per-instance identifiers (generated once at startup)
 const DEVICE_ID = crypto.randomBytes(32).toString('hex');
 const INSTANCE_SESSION_ID = crypto.randomUUID();
+
+// ───────────────────────── PROMETHEUS METRICS ──────────────────────────
+// Stdlib-only exposition. Scraped at /metrics by kube-prometheus-stack so
+// Hermes/OpenClaw can see per-caller × per-model latency, token burn, and
+// OAuth refresh health — the three things that explain most prod weirdness.
+const PROCESS_STARTED_AT = Date.now();
+const DUR_BUCKETS = [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120];
+let inFlight = 0;
+const promCounters = { requests_total: {}, upstream_errors_total: {} };
+const promHistograms = { upstream_duration_seconds: {} };
+
+function labelKey(labels) {
+  return Object.entries(labels).map(([k, v]) => `${k}=${v}`).join('|');
+}
+function incCounter(name, labels, value = 1) {
+  const s = promCounters[name];
+  const key = labelKey(labels);
+  if (!s[key]) s[key] = { labels, value: 0 };
+  s[key].value += value;
+}
+function observeHistogram(name, labels, value) {
+  const s = promHistograms[name];
+  const key = labelKey(labels);
+  if (!s[key]) {
+    const buckets = {};
+    for (const b of DUR_BUCKETS) buckets[b] = 0;
+    s[key] = { labels, sum: 0, count: 0, buckets };
+  }
+  const h = s[key];
+  h.sum += value;
+  h.count += 1;
+  for (const b of DUR_BUCKETS) if (value <= b) h.buckets[b] += 1;
+}
+function renderLabels(labels) {
+  return Object.entries(labels)
+    .map(([k, v]) => `${k}="${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`)
+    .join(',');
+}
+function extractModel(bodyStr) {
+  const m = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
+  return m ? m[1] : 'unknown';
+}
+// ─────────────────── CHAT REPLAY RING BUFFER ──────────────────────────
+// Last N request/response pairs kept in-memory so Hermes/OpenClaw can
+// pull the raw transcript for a specific request_id when debugging odd
+// Claude behavior. In-memory on purpose — a pod restart clears it, which
+// matches the troubleshooting lifecycle. For longer-lived audit we log
+// a structured line to stdout which Loki retains per its own schedule.
+const REPLAY_CAP = parseInt(process.env.BILLING_PROXY_REPLAY_CAP || '200', 10);
+const replayBuffer = []; // [{id, ts, caller, model, request, response, status, duration_ms, prompt_tokens, completion_tokens}]
+
+function pushReplay(entry) {
+  replayBuffer.push(entry);
+  while (replayBuffer.length > REPLAY_CAP) replayBuffer.shift();
+}
+function findReplay(id) {
+  return replayBuffer.find(r => r.id === id);
+}
+function listReplays(limit) {
+  const n = Math.min(limit || 50, replayBuffer.length);
+  return replayBuffer
+    .slice(-n)
+    .map(({ id, ts, caller, model, status, duration_ms, prompt_tokens, completion_tokens }) =>
+      ({ id, ts, caller, model, status, duration_ms, prompt_tokens, completion_tokens }));
+}
+
+function renderPromMetrics() {
+  const out = [];
+  const uptime = (Date.now() - PROCESS_STARTED_AT) / 1000;
+  out.push('# HELP billing_proxy_uptime_seconds Process uptime in seconds');
+  out.push('# TYPE billing_proxy_uptime_seconds gauge');
+  out.push(`billing_proxy_uptime_seconds ${uptime}`);
+  out.push('# HELP billing_proxy_requests_in_flight Currently in-flight upstream requests');
+  out.push('# TYPE billing_proxy_requests_in_flight gauge');
+  out.push(`billing_proxy_requests_in_flight ${inFlight}`);
+  for (const [name, series] of Object.entries(promCounters)) {
+    out.push(`# HELP billing_proxy_${name} ${name}`);
+    out.push(`# TYPE billing_proxy_${name} counter`);
+    for (const { labels, value } of Object.values(series)) {
+      out.push(`billing_proxy_${name}{${renderLabels(labels)}} ${value}`);
+    }
+  }
+  for (const [name, series] of Object.entries(promHistograms)) {
+    out.push(`# HELP billing_proxy_${name} ${name}`);
+    out.push(`# TYPE billing_proxy_${name} histogram`);
+    for (const h of Object.values(series)) {
+      const base = renderLabels(h.labels);
+      for (const b of DUR_BUCKETS) {
+        out.push(`billing_proxy_${name}_bucket{${base},le="${b}"} ${h.buckets[b]}`);
+      }
+      out.push(`billing_proxy_${name}_bucket{${base},le="+Inf"} ${h.count}`);
+      out.push(`billing_proxy_${name}_sum{${base}} ${h.sum}`);
+      out.push(`billing_proxy_${name}_count{${base}} ${h.count}`);
+    }
+  }
+  out.push('# HELP billing_proxy_token_expires_seconds Seconds until the active OAuth access token expires');
+  out.push('# TYPE billing_proxy_token_expires_seconds gauge');
+  const expSecs = runtimeToken ? (runtimeToken.expiresAt - Date.now()) / 1000 : -1;
+  out.push(`billing_proxy_token_expires_seconds ${expSecs}`);
+  out.push('# HELP billing_proxy_refresh_attempts_total OAuth refresh attempts since start');
+  out.push('# TYPE billing_proxy_refresh_attempts_total counter');
+  out.push(`billing_proxy_refresh_attempts_total ${refreshStats.attempts}`);
+  out.push('# HELP billing_proxy_refresh_successes_total OAuth refresh successes since start');
+  out.push('# TYPE billing_proxy_refresh_successes_total counter');
+  out.push(`billing_proxy_refresh_successes_total ${refreshStats.successes}`);
+  out.push('# HELP billing_proxy_refresh_failures_total OAuth refresh failures since start');
+  out.push('# TYPE billing_proxy_refresh_failures_total counter');
+  out.push(`billing_proxy_refresh_failures_total ${refreshStats.failures}`);
+  return out.join('\n') + '\n';
+}
 
 // Beta flags for OpenClaw-flavored (full cloak) requests. Emulates Claude Code.
 const REQUIRED_BETAS = [
@@ -1273,6 +1383,28 @@ function startServer(config) {
   const startedAt = Date.now();
 
   const server = http.createServer((req, res) => {
+    if (req.url === '/metrics' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+      res.end(renderPromMetrics());
+      return;
+    }
+    // Replay endpoints — list the most-recent request IDs, or pull full
+    // transcript by ID. Used by chat-replay CLI and ad-hoc debugging.
+    if (req.method === 'GET' && req.url.startsWith('/replays')) {
+      const m = req.url.match(/^\/replays\/([A-Za-z0-9_-]+)$/);
+      if (m) {
+        const entry = findReplay(m[1]);
+        if (!entry) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return; }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(entry));
+        return;
+      }
+      const limitM = req.url.match(/[?&]limit=(\d+)/);
+      const limit = limitM ? parseInt(limitM[1], 10) : 50;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ count: replayBuffer.length, cap: REPLAY_CAP, entries: listReplays(limit) }));
+      return;
+    }
     if (req.url === '/health' && req.method === 'GET') {
       try {
         const oauth = getToken(config.credsPath);
@@ -1312,6 +1444,86 @@ function startServer(config) {
     const reqNum = requestCount;
     const chunks = [];
 
+    // Prometheus instrumentation — uses res.on('close') so every exit path
+    // (normal / SSE / error / 401 retry) reports exactly once, with whatever
+    // caller+model we learned before finalizing. No per-branch plumbing.
+    const reqStartTime = Date.now();
+    const replayId = crypto.randomBytes(6).toString('hex');
+    let promCaller = 'unknown';
+    let promModel = 'unknown';
+    let capturedRequestBody = '';
+    let capturedResponseChunks = [];
+    let capturedPromptTokens = 0;
+    let capturedCompletionTokens = 0;
+    inFlight++;
+
+    // Tee the outgoing response bytes into the replay buffer. Wrap res.write
+    // and res.end before any handler calls them. Cheap — just a push.
+    const origWrite = res.write.bind(res);
+    const origEnd = res.end.bind(res);
+    res.write = function (chunk, ...rest) {
+      if (chunk) capturedResponseChunks.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+      return origWrite(chunk, ...rest);
+    };
+    res.end = function (chunk, ...rest) {
+      if (chunk) capturedResponseChunks.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+      return origEnd(chunk, ...rest);
+    };
+
+    res.on('close', () => {
+      inFlight--;
+      const dur = (Date.now() - reqStartTime) / 1000;
+      const durMs = Date.now() - reqStartTime;
+      incCounter('requests_total', {
+        caller: promCaller,
+        model: promModel,
+        status: res.statusCode || 0,
+      });
+      observeHistogram('upstream_duration_seconds',
+        { caller: promCaller, model: promModel }, dur);
+      // Persist request+response to the in-memory ring buffer + emit a
+      // structured log line that Loki can search by request_id.
+      const responseBody = capturedResponseChunks.join('');
+      // Try to parse tokens from non-SSE JSON responses; SSE encodes them
+      // in the message_delta event (usage.output_tokens).
+      try {
+        const parsed = JSON.parse(responseBody);
+        if (parsed && parsed.usage) {
+          capturedPromptTokens = parsed.usage.input_tokens || 0;
+          capturedCompletionTokens = parsed.usage.output_tokens || 0;
+        }
+      } catch (_) {
+        const m = responseBody.match(/"output_tokens":(\d+)/);
+        if (m) capturedCompletionTokens = parseInt(m[1], 10);
+        const m2 = responseBody.match(/"input_tokens":(\d+)/);
+        if (m2) capturedPromptTokens = parseInt(m2[1], 10);
+      }
+      pushReplay({
+        id: replayId,
+        ts: new Date().toISOString(),
+        caller: promCaller,
+        model: promModel,
+        method: req.method,
+        url: req.url,
+        status: res.statusCode || 0,
+        duration_ms: durMs,
+        prompt_tokens: capturedPromptTokens,
+        completion_tokens: capturedCompletionTokens,
+        request: capturedRequestBody,
+        response: responseBody,
+      });
+      console.log(JSON.stringify({
+        event: 'billing_proxy.replay_captured',
+        request_id: replayId,
+        caller: promCaller,
+        model: promModel,
+        status: res.statusCode || 0,
+        duration_ms: durMs,
+        prompt_tokens: capturedPromptTokens,
+        completion_tokens: capturedCompletionTokens,
+      }));
+    });
+
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
       let body = Buffer.concat(chunks);
@@ -1324,6 +1536,8 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
+      // Snapshot the ORIGINAL request for replay, before sanitization.
+      capturedRequestBody = bodyStr;
 
       // OpenAI chat-completions translation (Phase 1 — non-streaming only).
       // Rewrites the request body from OpenAI shape to Anthropic native AND
@@ -1360,6 +1574,8 @@ function startServer(config) {
       // layers 2-6 are no-ops for them; layer 1 (billing block) is what
       // lifts the rate-limit penalty. One code path, simpler, proven.
       const kind = classifyRequest(bodyStr, req.headers, config); // 'oc' | 'plain' — kept for observability
+      promCaller = kind;
+      promModel = extractModel(bodyStr);
       bodyStr = injectCCIdentity(bodyStr); // ensure system field contains the identity line
       bodyStr = processBody(bodyStr, config); // applies layers 2-6 (no-op for plain content) + layer 1 billing block
       body = Buffer.from(bodyStr, 'utf8');
@@ -1551,6 +1767,7 @@ function startServer(config) {
       });
       upstream.on('error', e => {
         console.error(`[${ts}] #${reqNum} ERR: ${e.message}`);
+        incCounter('upstream_errors_total', { caller: promCaller, reason: e.code || 'network' });
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
