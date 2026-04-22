@@ -3,21 +3,23 @@ IMAGE     ?= openclaw-billing-proxy
 VERSION   := $(shell grep "^const VERSION" proxy.js | sed "s/.*'\(.*\)'.*/\1/")
 FULL_TAG  := $(REGISTRY)/$(IMAGE):$(VERSION)
 LATEST    := $(REGISTRY)/$(IMAGE):latest
+PLATFORM  ?= linux/arm64
 
-.PHONY: build push tag-latest release version
+.PHONY: build push release version
 
 version:
 	@echo "$(VERSION)"
 
+# Uses docker buildx (QEMU cross-compile) so an amd64 build host
+# produces an arm64 image for k3s on DGX. Plain `docker build` would
+# use the host arch — the node:18-alpine base starts, then the runtime
+# fails with `exec /usr/local/bin/docker-entrypoint.sh: exec format
+# error` on arm64. Kept consistent with the Python services' Makefiles.
 build:
-	docker build -t $(FULL_TAG) .
+	docker buildx build --platform $(PLATFORM) -t $(FULL_TAG) -t $(LATEST) .
 
-tag-latest: build
-	docker tag $(FULL_TAG) $(LATEST)
-
-push: tag-latest
-	docker push $(FULL_TAG)
-	docker push $(LATEST)
+push:
+	docker buildx build --platform $(PLATFORM) -t $(FULL_TAG) -t $(LATEST) --push .
 	@echo ""
 	@echo "Pushed:"
 	@echo "  $(FULL_TAG)"
