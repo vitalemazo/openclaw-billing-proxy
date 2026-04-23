@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.8.0';
+const VERSION = '3.0.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -559,6 +559,118 @@ let runtimeToken = null; // {accessToken, refreshToken, expiresAt, subscriptionT
 let refreshInFlight = false;
 const refreshStats = { attempts: 0, successes: 0, failures: 0, lastError: null, lastSuccessAt: null };
 
+// ─────────────────── TELEGRAM ALERTS (v2.9.0) ───────────────────
+// Fire-and-log Telegram alerts when OAuth is about to go stale. Exists
+// to prevent the 2026-04-23 outage pattern: tokens expired silently
+// while everything else looked healthy (probes green, metrics scraped,
+// dashboards quiet — until every downstream caller started 401'ing).
+//
+// Alert conditions:
+//   1. Refresh attempt FAILED (network, 400 rotated-refresh, 401, etc.)
+//   2. Token expires in < threshold minutes AND no successful refresh
+//      has rotated it yet (catches the "refresh loop itself is broken"
+//      case — counter stops incrementing = no attempts happening)
+//
+// Rate-limited to once per ALERT_COOLDOWN_MS per kind so a repeated-
+// failure storm doesn't flood your phone. State resets on first
+// successful refresh — so a single success silences the alert cycle.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const ALERT_THRESHOLD_MIN = parseInt(
+  process.env.BILLING_PROXY_ALERT_THRESHOLD_MIN || '30', 10
+);
+const ALERT_COOLDOWN_MS = parseInt(
+  process.env.BILLING_PROXY_ALERT_COOLDOWN_MS || String(30 * 60 * 1000), 10
+);
+const alertState = {
+  lastRefreshFailureAt: 0,    // ms since epoch of last 'refresh_failed' alert
+  lastExpireSoonAt: 0,        // ms since epoch of last 'expire_soon' alert
+  consecutiveFailures: 0,
+};
+
+function telegramEnabled() {
+  return Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+}
+
+function sendTelegramAlert(kind, text) {
+  // Silent no-op if creds unset (dev / test).
+  if (!telegramEnabled()) return;
+  const now = Date.now();
+  // Rate-limit per kind
+  const lastKey = `last${kind.charAt(0).toUpperCase() + kind.slice(1)}At`;
+  const last = alertState[lastKey];
+  if (typeof last === 'number' && now - last < ALERT_COOLDOWN_MS) return;
+  alertState[lastKey] = now;
+
+  const body = JSON.stringify({
+    chat_id: TELEGRAM_CHAT_ID,
+    text: `[billing-proxy ${VERSION}] ${text}`,
+    disable_web_page_preview: true,
+  });
+  const opts = {
+    hostname: 'api.telegram.org',
+    port: 443,
+    path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    },
+  };
+  const req = https.request(opts, (res) => {
+    // Drain to avoid socket leaks; ignore body — Telegram API 200 OK
+    // is all we need. Any non-2xx we log but don't retry (this is an
+    // alert, not a transaction; we'll alert again on next failure).
+    res.on('data', () => {});
+    if (res.statusCode >= 300) {
+      console.error(`[ALERT] telegram ${res.statusCode} for ${kind}`);
+    }
+  });
+  req.on('error', (e) => {
+    console.error(`[ALERT] telegram send ${kind} failed: ${e.message}`);
+  });
+  req.write(body);
+  req.end();
+}
+
+// Probe expire-soon condition every minute. Independent of maybeRefresh
+// so we catch the case where the refresh loop itself has stalled
+// (attempts counter stops incrementing = lead time passed but code
+// never ran).
+function startExpireSoonWatch(credsPath) {
+  setInterval(() => {
+    try {
+      const t = getToken(credsPath);
+      if (!t || !t.expiresAt || t.expiresAt === Infinity) return;
+      const msLeft = t.expiresAt - Date.now();
+      const minLeft = msLeft / 60000;
+      if (minLeft > ALERT_THRESHOLD_MIN) return;
+      // Under threshold — but only alert if NO recent successful refresh
+      // (if refresh happened within the last hour we're mid-rotation
+      // and msLeft going below threshold is normal).
+      const lastOK = refreshStats.lastSuccessAt
+        ? new Date(refreshStats.lastSuccessAt).getTime()
+        : 0;
+      const minSinceLastRefresh = (Date.now() - lastOK) / 60000;
+      if (lastOK && minSinceLastRefresh < 60) return;
+      sendTelegramAlert(
+        'expireSoon',
+        `⚠️ Claude OAuth token expires in ${minLeft.toFixed(1)}min. ` +
+        `Last successful refresh: ${refreshStats.lastSuccessAt || 'never'}. ` +
+        `Refresh attempts/successes/failures: ${refreshStats.attempts}/` +
+        `${refreshStats.successes}/${refreshStats.failures}. ` +
+        `Last error: ${refreshStats.lastError || 'none'}.`
+      );
+    } catch (e) {
+      // Can't read token file — alert that too, once per cooldown
+      sendTelegramAlert(
+        'expireSoon',
+        `⚠️ Cannot read OAuth creds file: ${e.message}`
+      );
+    }
+  }, 60 * 1000).unref();
+}
+
 function getToken(credsPath) {
   // Env var mode: return synthetic OAuth object without file I/O
   if (credsPath === 'env') {
@@ -662,6 +774,9 @@ async function maybeRefresh(credsPath) {
     refreshStats.successes++;
     refreshStats.lastSuccessAt = new Date().toISOString();
     refreshStats.lastError = null;
+    // Clear the failure-streak counter on success so the next failure
+    // starts a fresh cooldown (rather than silenced by prior alerts).
+    alertState.consecutiveFailures = 0;
     const hours = ((newExpiresAt - Date.now()) / 3600000).toFixed(1);
     // Persist to Vault so ESO re-syncs the same values back and pod restarts
     // don't reuse an already-rotated refresh_token (which would 400 and brick
@@ -683,7 +798,25 @@ async function maybeRefresh(credsPath) {
   } catch (e) {
     refreshStats.failures++;
     refreshStats.lastError = e.message;
+    alertState.consecutiveFailures++;
     console.error(`[REFRESH] failed: ${e.message}`);
+    // Fire Telegram alert on refresh failure — rate-limited to once
+    // per ALERT_COOLDOWN_MS (default 30min) so a repeated-failure storm
+    // doesn't flood your phone.
+    let currentExp = null;
+    try {
+      currentExp = getToken(credsPath);
+    } catch (_) { /* ignore */ }
+    const minLeft = currentExp && currentExp.expiresAt
+      ? ((currentExp.expiresAt - Date.now()) / 60000).toFixed(1)
+      : '?';
+    sendTelegramAlert(
+      'refreshFailure',
+      `🚨 Claude OAuth refresh FAILED (attempt ${refreshStats.attempts}, ` +
+      `consecutive failures: ${alertState.consecutiveFailures}).\n` +
+      `Token expires in ${minLeft}min.\n` +
+      `Error: ${e.message}`
+    );
   } finally {
     refreshInFlight = false;
   }
@@ -780,6 +913,16 @@ function startAutoRefresh(credsPath) {
   // Fire once on startup (after server is listening) then every interval
   setTimeout(() => maybeRefresh(credsPath), 10000);
   setInterval(() => maybeRefresh(credsPath), REFRESH_INTERVAL_MS);
+
+  // Start the independent expire-soon watch. Catches the 'refresh loop
+  // stalled' case where maybeRefresh stops incrementing counters for
+  // an unknown reason — we'd still page the operator on time.
+  if (telegramEnabled()) {
+    console.log(`[ALERT] Telegram alerts ENABLED. Threshold: ${ALERT_THRESHOLD_MIN}min, cooldown: ${ALERT_COOLDOWN_MS/60000}min.`);
+    startExpireSoonWatch(credsPath);
+  } else {
+    console.log('[ALERT] Telegram alerts DISABLED (TELEGRAM_BOT_TOKEN/CHAT_ID unset).');
+  }
 }
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
@@ -931,6 +1074,279 @@ function injectCCIdentity(bodyStr) {
 
   // Malformed body — don't touch it, let Anthropic return the error
   return bodyStr;
+}
+
+// ─────────────── PHASE-1 MULTI-PROVIDER (v3.0 draft) ────────────────────────
+// When PROVIDER_PRIMARY=openai, incoming /v1/messages requests (Anthropic
+// format) are translated to /v1/chat/completions (OpenAI format) and
+// forwarded to the openai-oauth sidecar at 127.0.0.1:10531. The response
+// is translated back to Anthropic format before returning to the caller.
+//
+// PROVIDER_PRIMARY=anthropic (default) = existing behavior (no translation,
+// direct forward to api.anthropic.com).
+//
+// On OpenAI path failure (sidecar 5xx, network error, 401), the request is
+// retried against the Anthropic path — cross-provider failover at the
+// request boundary. Mid-request provider switches are never performed
+// (preserves trade-review auditability: one decision, one model).
+const PROVIDER_PRIMARY = (process.env.PROVIDER_PRIMARY || 'anthropic').toLowerCase();
+const OPENAI_SIDECAR_HOST = process.env.OPENAI_SIDECAR_HOST || '127.0.0.1';
+const OPENAI_SIDECAR_PORT = parseInt(process.env.OPENAI_SIDECAR_PORT || '10531', 10);
+// Default model to use when Anthropic requests a model that isn't an
+// OpenAI name. Can be overridden per-request via x-openai-model header.
+// gpt-5 pseudonym falls through to whatever the user's ChatGPT account
+// exposes via the sidecar's --models allowlist.
+const DEFAULT_OPENAI_MODEL = process.env.DEFAULT_OPENAI_MODEL || 'gpt-5';
+
+function isAnthropicMessages(urlPath) {
+  return urlPath === '/v1/messages' || urlPath.startsWith('/v1/messages?');
+}
+
+// Anthropic /v1/messages body → OpenAI /v1/chat/completions body (JSON strings).
+// Throws on malformed input. Returns {body, model, stream}.
+function anthropicToOpenAIRequest(bodyStr) {
+  const req = JSON.parse(bodyStr);
+  const out = {
+    model: mapAnthropicModelToOpenAI(req.model),
+    messages: [],
+  };
+
+  // Straightforward pass-throughs
+  if (typeof req.temperature === 'number') out.temperature = req.temperature;
+  if (typeof req.top_p === 'number') out.top_p = req.top_p;
+  if (typeof req.max_tokens === 'number') out.max_tokens = req.max_tokens;
+  if (req.stream === true) out.stream = true;
+  if (Array.isArray(req.stop_sequences) && req.stop_sequences.length > 0) {
+    out.stop = req.stop_sequences;
+  }
+
+  // System prompt — Anthropic top-level param → OpenAI first message
+  if (req.system) {
+    const sys = typeof req.system === 'string'
+      ? req.system
+      : (Array.isArray(req.system)
+          ? req.system.map(p => (p && p.text) || '').filter(Boolean).join('\n\n')
+          : '');
+    if (sys) out.messages.push({ role: 'system', content: sys });
+  }
+
+  // Messages — translate content blocks → string + tool_calls
+  const messages = Array.isArray(req.messages) ? req.messages : [];
+  for (const m of messages) {
+    const role = m.role;
+    const content = m.content;
+
+    if (typeof content === 'string') {
+      // Simple string content passes directly
+      out.messages.push({ role, content });
+      continue;
+    }
+    if (!Array.isArray(content)) {
+      out.messages.push({ role, content: '' });
+      continue;
+    }
+
+    // Block-array content. Aggregate text; tool_use → tool_calls on assistant
+    // messages; tool_result → a follow-up `tool` role message.
+    const textParts = [];
+    const toolCalls = [];
+    const toolResults = []; // emitted as separate `tool` role messages after
+    for (const b of content) {
+      if (!b || typeof b !== 'object') continue;
+      if (b.type === 'text' && typeof b.text === 'string') {
+        textParts.push(b.text);
+      } else if (b.type === 'tool_use' && role === 'assistant') {
+        toolCalls.push({
+          id: b.id || ('call_' + crypto.randomBytes(8).toString('hex')),
+          type: 'function',
+          function: {
+            name: b.name,
+            arguments: typeof b.input === 'string' ? b.input : JSON.stringify(b.input || {}),
+          },
+        });
+      } else if (b.type === 'tool_result') {
+        toolResults.push({
+          role: 'tool',
+          tool_call_id: b.tool_use_id,
+          content: typeof b.content === 'string'
+            ? b.content
+            : (Array.isArray(b.content)
+                ? b.content.map(c => (c && c.text) || '').join('\n')
+                : JSON.stringify(b.content || '')),
+        });
+      } else if (b.type === 'thinking') {
+        // Anthropic extended-thinking blocks have no OpenAI equivalent.
+        // Strip them on translation; OpenAI reasoning models (o-series)
+        // produce their own reasoning traces that we don't surface.
+        continue;
+      }
+      // Ignore other block types (image, document, etc.) for phase 1.
+    }
+
+    const msg = { role, content: textParts.join('') || null };
+    if (toolCalls.length > 0) msg.tool_calls = toolCalls;
+    out.messages.push(msg);
+
+    // tool_result blocks in Anthropic user messages become separate
+    // OpenAI tool-role messages that follow.
+    for (const tr of toolResults) out.messages.push(tr);
+  }
+
+  // Tools — Anthropic {name, description, input_schema} → OpenAI
+  // {type:'function', function:{name, description, parameters}}
+  if (Array.isArray(req.tools) && req.tools.length > 0) {
+    out.tools = req.tools.map(t => ({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: t.description || '',
+        parameters: t.input_schema || { type: 'object', properties: {} },
+      },
+    }));
+  }
+  if (req.tool_choice) {
+    const tc = req.tool_choice;
+    if (tc.type === 'auto') out.tool_choice = 'auto';
+    else if (tc.type === 'any') out.tool_choice = 'required';
+    else if (tc.type === 'tool' && tc.name) {
+      out.tool_choice = { type: 'function', function: { name: tc.name } };
+    }
+  }
+
+  return { body: JSON.stringify(out), model: out.model, stream: !!out.stream };
+}
+
+// Model-name mapping. ChatGPT OAuth can only serve what the user's
+// subscription exposes; we map Anthropic model names to a reasonable
+// OpenAI equivalent. Callers can override via DEFAULT_OPENAI_MODEL
+// env or a per-strategy config when the router lands.
+function mapAnthropicModelToOpenAI(anthModel) {
+  if (!anthModel) return DEFAULT_OPENAI_MODEL;
+  const s = String(anthModel).toLowerCase();
+  // Opus-tier (reasoning-heavy) → gpt-5 or whatever the Pro account
+  // has. Haiku-tier (cheap/fast) → gpt-4o-mini. Sonnet-tier → gpt-4o.
+  if (s.includes('opus')) return process.env.OPENAI_MODEL_OPUS || DEFAULT_OPENAI_MODEL;
+  if (s.includes('sonnet')) return process.env.OPENAI_MODEL_SONNET || DEFAULT_OPENAI_MODEL;
+  if (s.includes('haiku')) return process.env.OPENAI_MODEL_HAIKU || 'gpt-4o-mini';
+  return DEFAULT_OPENAI_MODEL;
+}
+
+// OpenAI /v1/chat/completions response body → Anthropic /v1/messages response.
+function openAIToAnthropicResponse(respBodyStr, origModelName) {
+  let resp;
+  try { resp = JSON.parse(respBodyStr); } catch (_) { return respBodyStr; }
+  if (!resp || resp.error) return respBodyStr;
+
+  const choice = (Array.isArray(resp.choices) && resp.choices[0]) || {};
+  const msg = choice.message || {};
+  const contentBlocks = [];
+  if (typeof msg.content === 'string' && msg.content.length > 0) {
+    contentBlocks.push({ type: 'text', text: msg.content });
+  }
+  if (Array.isArray(msg.tool_calls)) {
+    for (const tc of msg.tool_calls) {
+      let parsed = {};
+      if (tc.function && typeof tc.function.arguments === 'string') {
+        try { parsed = JSON.parse(tc.function.arguments); } catch (_) { parsed = {}; }
+      }
+      contentBlocks.push({
+        type: 'tool_use',
+        id: tc.id,
+        name: tc.function && tc.function.name,
+        input: parsed,
+      });
+    }
+  }
+
+  const finishMap = {
+    stop: 'end_turn',
+    length: 'max_tokens',
+    tool_calls: 'tool_use',
+    content_filter: 'end_turn',
+  };
+  const stopReason = finishMap[choice.finish_reason] || 'end_turn';
+
+  const out = {
+    id: resp.id || ('msg_' + crypto.randomBytes(12).toString('hex')),
+    type: 'message',
+    role: 'assistant',
+    model: origModelName || resp.model || 'unknown',
+    content: contentBlocks,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: (resp.usage && resp.usage.prompt_tokens) || 0,
+      output_tokens: (resp.usage && resp.usage.completion_tokens) || 0,
+    },
+  };
+  return JSON.stringify(out);
+}
+
+// POST Anthropic /v1/messages body to the in-Pod openai-oauth sidecar and
+// return a translated-back Anthropic response body. Returns:
+//   { ok: true,  body: string, upstreamStatus: number }       — use this
+//   { ok: false, error: string, error_type: string, status?: number } — fall through
+// Non-streaming only (phase 1). Sidecar listens on 127.0.0.1:10531.
+function tryOpenAIRoute(anthropicBodyStr) {
+  return new Promise((resolve) => {
+    let translated;
+    let originalModel = null;
+    try {
+      const t = anthropicToOpenAIRequest(anthropicBodyStr);
+      translated = t.body;
+      originalModel = t.model || null;
+    } catch (e) {
+      resolve({ ok: false, error: 'translate_request_failed: ' + e.message, error_type: 'translate_in' });
+      return;
+    }
+
+    const tBuf = Buffer.from(translated, 'utf8');
+    const opts = {
+      host: OPENAI_SIDECAR_HOST,
+      port: OPENAI_SIDECAR_PORT,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': tBuf.length,
+        'Accept': 'application/json',
+      },
+      timeout: 120_000,
+    };
+
+    const hreq = http.request(opts, (hres) => {
+      const rchunks = [];
+      hres.on('data', (c) => rchunks.push(c));
+      hres.on('end', () => {
+        const raw = Buffer.concat(rchunks).toString('utf8');
+        const status = hres.statusCode || 0;
+        if (status >= 500 || status === 429) {
+          resolve({ ok: false, error: `sidecar_status_${status}`, error_type: 'upstream_5xx', status });
+          return;
+        }
+        if (status >= 400) {
+          // 4xx from the sidecar is likely auth/quota — log but still
+          // fall through to Anthropic so callers don't see a hard failure.
+          resolve({ ok: false, error: `sidecar_status_${status}: ${raw.slice(0, 200)}`, error_type: 'upstream_4xx', status });
+          return;
+        }
+        try {
+          const translatedBack = openAIToAnthropicResponse(raw, originalModel);
+          resolve({ ok: true, body: translatedBack, upstreamStatus: status });
+        } catch (e) {
+          resolve({ ok: false, error: 'translate_response_failed: ' + e.message, error_type: 'translate_out' });
+        }
+      });
+    });
+    hreq.on('timeout', () => {
+      hreq.destroy(new Error('sidecar_timeout'));
+    });
+    hreq.on('error', (e) => {
+      resolve({ ok: false, error: e.message, error_type: 'network' });
+    });
+    hreq.write(tBuf);
+    hreq.end();
+  });
 }
 
 // ─── OpenAI-compat /v1/chat/completions ↔ Anthropic /v1/messages translation ─
@@ -1525,7 +1941,7 @@ function startServer(config) {
     });
 
     req.on('data', c => chunks.push(c));
-    req.on('end', () => {
+    req.on('end', async () => {
       let body = Buffer.concat(chunks);
       let oauth;
       try { oauth = getToken(config.credsPath); } catch (e) {
@@ -1538,6 +1954,48 @@ function startServer(config) {
       const originalSize = bodyStr.length;
       // Snapshot the ORIGINAL request for replay, before sanitization.
       capturedRequestBody = bodyStr;
+
+      // ───── Multi-provider routing (v3.0 phase 1) ─────
+      // If PROVIDER_PRIMARY=openai AND the request is Anthropic
+      // /v1/messages, attempt OpenAI via the sidecar first. On failure
+      // (sidecar down, 5xx, network), fall through to the existing
+      // Anthropic path below. Streaming requests skip this path for
+      // now — phase 1 is non-streaming only.
+      if (
+        PROVIDER_PRIMARY === 'openai' &&
+        isAnthropicMessages(req.url) &&
+        (req.method === 'POST' || req.method === 'post')
+      ) {
+        let parsedForStream;
+        try { parsedForStream = JSON.parse(bodyStr); } catch (_) { parsedForStream = {}; }
+        if (parsedForStream && parsedForStream.stream !== true) {
+          const openaiResult = await tryOpenAIRoute(bodyStr);
+          if (openaiResult.ok) {
+            // Success — respond with translated body, skip Anthropic.
+            // Replay-ring capture is Anthropic-path-specific; phase-1
+            // OpenAI responses skip replay (logs carry enough signal).
+            res.writeHead(200, {
+              'Content-Type': 'application/json',
+              'x-proxy-provider': 'openai',
+              'x-proxy-upstream-status': String(openaiResult.upstreamStatus),
+            });
+            res.end(openaiResult.body);
+            incCounter('requests_total', {
+              provider: 'openai',
+              caller: 'openai-primary',
+              model: parsedForStream.model || '',
+              status: '200',
+            });
+            return;
+          }
+          // Log failover and continue to Anthropic path below
+          console.error(`[FAILOVER] openai→anthropic: ${openaiResult.error}`);
+          incCounter('upstream_errors_total', {
+            provider: 'openai',
+            error_type: openaiResult.error_type || 'unknown',
+          });
+        }
+      }
 
       // OpenAI chat-completions translation (Phase 1 — non-streaming only).
       // Rewrites the request body from OpenAI shape to Anthropic native AND
