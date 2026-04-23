@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '3.0.0';
+const VERSION = '3.0.1';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -1096,7 +1096,7 @@ const OPENAI_SIDECAR_PORT = parseInt(process.env.OPENAI_SIDECAR_PORT || '10531',
 // OpenAI name. Can be overridden per-request via x-openai-model header.
 // gpt-5 pseudonym falls through to whatever the user's ChatGPT account
 // exposes via the sidecar's --models allowlist.
-const DEFAULT_OPENAI_MODEL = process.env.DEFAULT_OPENAI_MODEL || 'gpt-5';
+const DEFAULT_OPENAI_MODEL = process.env.DEFAULT_OPENAI_MODEL || 'gpt-5.4';
 
 function isAnthropicMessages(urlPath) {
   return urlPath === '/v1/messages' || urlPath.startsWith('/v1/messages?');
@@ -1223,11 +1223,14 @@ function anthropicToOpenAIRequest(bodyStr) {
 function mapAnthropicModelToOpenAI(anthModel) {
   if (!anthModel) return DEFAULT_OPENAI_MODEL;
   const s = String(anthModel).toLowerCase();
-  // Opus-tier (reasoning-heavy) → gpt-5 or whatever the Pro account
-  // has. Haiku-tier (cheap/fast) → gpt-4o-mini. Sonnet-tier → gpt-4o.
-  if (s.includes('opus')) return process.env.OPENAI_MODEL_OPUS || DEFAULT_OPENAI_MODEL;
-  if (s.includes('sonnet')) return process.env.OPENAI_MODEL_SONNET || DEFAULT_OPENAI_MODEL;
-  if (s.includes('haiku')) return process.env.OPENAI_MODEL_HAIKU || 'gpt-4o-mini';
+  // ChatGPT OAuth (EvanZhouDev/openai-oauth) serves a subscription-
+  // scoped model list: gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex,
+  // gpt-5.3-codex-spark, gpt-5.2, codex-auto-review.
+  // Map Opus → gpt-5.5 (flagship), Sonnet → gpt-5.4 (balanced),
+  // Haiku → gpt-5.4-mini (cheap/fast). All overridable via env.
+  if (s.includes('opus')) return process.env.OPENAI_MODEL_OPUS || 'gpt-5.5';
+  if (s.includes('sonnet')) return process.env.OPENAI_MODEL_SONNET || 'gpt-5.4';
+  if (s.includes('haiku')) return process.env.OPENAI_MODEL_HAIKU || 'gpt-5.4-mini';
   return DEFAULT_OPENAI_MODEL;
 }
 
