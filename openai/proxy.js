@@ -16,7 +16,7 @@
 const http = require('http');
 const crypto = require('crypto');
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 // ─── Configuration ────────────────────────────────────────────────
 const PROXY_HOST = process.env.PROXY_HOST || '0.0.0.0';
@@ -69,6 +69,9 @@ const metrics = {
   durationBuckets: new Map(),
   // openai_proxy_translate_errors_total{direction, error_type}
   translateErrors: new Map(),
+  // openai_proxy_tokens_approx_total{caller, model_out, direction} — char/4
+  // estimates; surfaces in Grafana since ChatGPT OAuth returns 0 tokens.
+  tokensApprox: new Map(),
   inFlight: 0,
 };
 
@@ -102,6 +105,9 @@ function renderPrometheus() {
   L.push('# HELP openai_proxy_translate_errors_total Request/response translation failures.');
   L.push('# TYPE openai_proxy_translate_errors_total counter');
   for (const [k, v] of metrics.translateErrors) L.push(`openai_proxy_translate_errors_total{${k}} ${v}`);
+  L.push('# HELP openai_proxy_tokens_approx_total Approximate token counts (char/4) for the OpenAI path — ChatGPT OAuth does not surface real counts.');
+  L.push('# TYPE openai_proxy_tokens_approx_total counter');
+  for (const [k, v] of metrics.tokensApprox) L.push(`openai_proxy_tokens_approx_total{${k}} ${v}`);
   L.push('# HELP openai_proxy_requests_in_flight In-flight.');
   L.push('# TYPE openai_proxy_requests_in_flight gauge');
   L.push(`openai_proxy_requests_in_flight ${metrics.inFlight}`);
@@ -215,6 +221,64 @@ function anthropicToOpenAIRequest(bodyStr) {
   }
 
   return { body: JSON.stringify(out), model: out.model, stream: !!out.stream, originalModel: req.model };
+}
+
+// Token-count approximation for the OpenAI path.
+//
+// The openai-oauth sidecar (backed by ChatGPT OAuth) returns
+// `usage: {prompt_tokens: 0, completion_tokens: 0, total_tokens: 0}` —
+// the ChatGPT backend-api doesn't expose real counts. Downstream
+// services read usage.*_tokens to populate llm_tokens_total, so without
+// substitution every OpenAI-routed request counts as 0 tokens in
+// Grafana and the burn panels under-count badly.
+//
+// Approximation: char/4 on the combined text content. OpenAI's public
+// guidance says "1 token ≈ 4 chars in English" for gpt-family tokenizers.
+// Not exact but gives a trendable signal. Tagged with `approx: true` in
+// the response so downstream can distinguish estimates from truth.
+function approxTokens(text) {
+  if (!text) return 0;
+  // Conservative round-up so zero-length text still reports 0 tokens
+  // but anything non-trivial gets at least 1.
+  return Math.ceil(text.length / 4);
+}
+
+// Extract all text content from a parsed Anthropic-shaped request body
+// for input-token approximation. Walks messages[].content (string or
+// block array) + top-level system.
+function collectRequestText(reqObj) {
+  if (!reqObj) return '';
+  const parts = [];
+  if (typeof reqObj.system === 'string') parts.push(reqObj.system);
+  else if (Array.isArray(reqObj.system)) {
+    for (const p of reqObj.system) if (p && typeof p.text === 'string') parts.push(p.text);
+  }
+  for (const m of (reqObj.messages || [])) {
+    const c = m.content;
+    if (typeof c === 'string') parts.push(c);
+    else if (Array.isArray(c)) {
+      for (const b of c) {
+        if (!b || typeof b !== 'object') continue;
+        if (typeof b.text === 'string') parts.push(b.text);
+        if (b.type === 'tool_use' && b.input) parts.push(JSON.stringify(b.input));
+        if (b.type === 'tool_result' && typeof b.content === 'string') parts.push(b.content);
+      }
+    }
+  }
+  return parts.join('\n');
+}
+
+// Extract the assistant's text content from a translated Anthropic
+// response for output-token approximation.
+function collectResponseText(respObj) {
+  if (!respObj) return '';
+  const parts = [];
+  for (const b of (respObj.content || [])) {
+    if (!b || typeof b !== 'object') continue;
+    if (typeof b.text === 'string') parts.push(b.text);
+    if (b.type === 'tool_use' && b.input) parts.push(JSON.stringify(b.input));
+  }
+  return parts.join('\n');
 }
 
 // ─── Response translation (OpenAI ChatCompletions → Anthropic /v1/messages) ─
@@ -385,6 +449,29 @@ async function handleMessages(req, res, bodyBuf) {
       error: { type: 'translate_error', message: 'Response translation failed: ' + e.message },
     }));
     return;
+  }
+
+  // Token-count approximation. ChatGPT OAuth backend doesn't surface
+  // real token counts; substitute char/4 estimates so downstream
+  // llm_tokens_total Prometheus counter isn't stuck at zero for the
+  // entire OpenAI routing path. Mark as approximate so consumers can
+  // distinguish.
+  try {
+    const reqObj = JSON.parse(bodyStr);
+    const respObj = JSON.parse(anthropicShaped);
+    if (respObj && respObj.usage && (respObj.usage.input_tokens === 0 && respObj.usage.output_tokens === 0)) {
+      const approxIn = approxTokens(collectRequestText(reqObj));
+      const approxOut = approxTokens(collectResponseText(respObj));
+      respObj.usage.input_tokens = approxIn;
+      respObj.usage.output_tokens = approxOut;
+      respObj.usage.approx = true;  // signal to downstream: these are estimates
+      anthropicShaped = JSON.stringify(respObj);
+      // Also emit as Prometheus counter for the dashboard's approx panel.
+      incCounter(metrics.tokensApprox, { caller, model_out: translated.model, direction: 'in' }, approxIn);
+      incCounter(metrics.tokensApprox, { caller, model_out: translated.model, direction: 'out' }, approxOut);
+    }
+  } catch (_) {
+    // If we can't parse, ship the translation verbatim — it's still valid.
   }
 
   metrics.inFlight -= 1;

@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '3.2.0';
+const VERSION = '3.3.0';
 
 // ─── Tier vocabulary ──────────────────────────────────────────────
 // Callers SHOULD send provider-agnostic tier names in the `model` field:
@@ -88,7 +88,7 @@ const INSTANCE_SESSION_ID = crypto.randomUUID();
 const PROCESS_STARTED_AT = Date.now();
 const DUR_BUCKETS = [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120];
 let inFlight = 0;
-const promCounters = { requests_total: {}, upstream_errors_total: {} };
+const promCounters = { requests_total: {}, upstream_errors_total: {}, tokens_total: {} };
 const promHistograms = { upstream_duration_seconds: {} };
 
 function labelKey(labels) {
@@ -1689,6 +1689,16 @@ function startServer(config) {
         request: capturedRequestBody,
         response: responseBody,
       });
+      // Also emit to Prometheus so Grafana's Token Burn panel sees
+      // authoritative per-caller counts without each Python service
+      // having to emit llm_tokens_total itself. Exact counts from the
+      // Anthropic upstream (different from openai-proxy's approx).
+      if (capturedPromptTokens > 0) {
+        incCounter('tokens_total', { caller: promCaller, model: promModel, direction: 'in' }, capturedPromptTokens);
+      }
+      if (capturedCompletionTokens > 0) {
+        incCounter('tokens_total', { caller: promCaller, model: promModel, direction: 'out' }, capturedCompletionTokens);
+      }
       console.log(JSON.stringify({
         event: 'billing_proxy.replay_captured',
         request_id: replayId,
