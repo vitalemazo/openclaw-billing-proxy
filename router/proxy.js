@@ -18,7 +18,7 @@ const http = require('http');
 const url = require('url');
 const crypto = require('crypto');
 
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 
 // ─── Configuration ────────────────────────────────────────────────
 const PROXY_HOST = process.env.PROXY_HOST || '0.0.0.0';
@@ -328,12 +328,50 @@ function isModelsEndpoint(urlPath) {
   return urlPath === '/v1/models' || urlPath.startsWith('/v1/models?') || urlPath === '/models';
 }
 
+// /v1/models/{id} — stub any known model so UI validators
+// (Recallium's Test Connection etc.) see the model as existing even
+// when the upstream provider's API returns 404 for it (e.g., Anthropic
+// OAuth catalog rotation where claude-sonnet-4-6 might not be listed
+// this week).
+function modelDetailMatch(urlPath) {
+  // e.g., "/v1/models/claude-sonnet-4-6" → "claude-sonnet-4-6"
+  const m = urlPath.match(/^\/v1\/models\/([^?/]+)(?:\?.*)?$/) || urlPath.match(/^\/models\/([^?/]+)(?:\?.*)?$/);
+  return m ? m[1] : null;
+}
+
+function singleModelResponse(modelId) {
+  // Every model in the synthetic /v1/models catalog is servable — the
+  // router knows how to resolve it. So any GET /v1/models/{id} where
+  // {id} is in our catalog (or is a known alias pattern) returns 200.
+  const known = new Set(openAIModelsResponse().data.map(m => m.id));
+  if (known.has(modelId)) {
+    return { status: 200, body: { id: modelId, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'llm-router' } };
+  }
+  // Unknown — check if it's a plausible tier/claude-*/gpt-* pattern. If
+  // so, stub it too (the router's resolver will handle at call time).
+  const s = String(modelId).toLowerCase();
+  if (s.includes('opus') || s.includes('sonnet') || s.includes('haiku')
+      || s.includes('gpt-') || s === 'flagship' || s === 'balanced' || s === 'fast') {
+    return { status: 200, body: { id: modelId, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'llm-router' } };
+  }
+  return { status: 404, body: { error: { message: `Model '${modelId}' not in router catalog` } } };
+}
+
 // ─── HTTP server ──────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   // /v1/models — synthetic catalog so UIs auto-discover tier names
   if (isModelsEndpoint(req.url) && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(openAIModelsResponse()));
+    return;
+  }
+
+  // /v1/models/{id} — stub individual model detail for UI validators
+  const detailId = modelDetailMatch(req.url);
+  if (detailId && req.method === 'GET') {
+    const resp = singleModelResponse(detailId);
+    res.writeHead(resp.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(resp.body));
     return;
   }
 
