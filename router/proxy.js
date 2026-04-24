@@ -18,7 +18,7 @@ const http = require('http');
 const url = require('url');
 const crypto = require('crypto');
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 
 // ─── Configuration ────────────────────────────────────────────────
 const PROXY_HOST = process.env.PROXY_HOST || '0.0.0.0';
@@ -131,11 +131,23 @@ function isOpenAIChatCompletions(urlPath) {
   return urlPath === '/v1/chat/completions' || urlPath.startsWith('/v1/chat/completions?');
 }
 
+// /v1/responses — ChatGPT's Codex/Responses unified API. OpenClaw's
+// "codex" provider (api=openai-codex-responses) sends here. Only
+// openai-proxy can serve this; anthropic has no equivalent.
+function isOpenAIResponses(urlPath) {
+  return urlPath === '/v1/responses' || urlPath.startsWith('/v1/responses?');
+}
+
 // Any path the router should route through primary/fallback rather than
 // passthrough. Non-routed paths (e.g., /v1/models) still passthrough to
 // anthropic since it's the metadata source.
 function isRoutedPath(urlPath) {
-  return isAnthropicMessages(urlPath) || isOpenAIChatCompletions(urlPath);
+  return isAnthropicMessages(urlPath) || isOpenAIChatCompletions(urlPath) || isOpenAIResponses(urlPath);
+}
+
+// Paths that only the OpenAI backend can serve (no anthropic fallback).
+function isOpenAIOnlyPath(urlPath) {
+  return isOpenAIResponses(urlPath);
 }
 
 function parseBackendURL(urlStr) {
@@ -225,6 +237,13 @@ async function route(req, res, bodyBuf) {
   } else {
     primary = { provider: 'anthropic', url: ANTHROPIC_URL };
     secondary = MODE === 'anthropic-primary' ? { provider: 'openai', url: OPENAI_URL } : null;
+  }
+
+  // OpenAI-only paths (e.g., /v1/responses) have no anthropic equivalent.
+  // Force primary = openai and disable fallback regardless of MODE.
+  if (isOpenAIOnlyPath(req.url)) {
+    primary = { provider: 'openai', url: OPENAI_URL };
+    secondary = null;
   }
 
   // Try primary
