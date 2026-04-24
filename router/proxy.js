@@ -18,7 +18,7 @@ const http = require('http');
 const url = require('url');
 const crypto = require('crypto');
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 
 // ─── Configuration ────────────────────────────────────────────────
 const PROXY_HOST = process.env.PROXY_HOST || '0.0.0.0';
@@ -297,8 +297,46 @@ function respondWith(res, backendResult, provider, outcome, caller, model) {
   }
 }
 
+// ─── /v1/models — synthetic model catalog ────────────────────────
+// Serves tier names as the primary options so OpenAI-compat UIs
+// (Recallium, LibreChat, etc.) that auto-discover models see the
+// right vocabulary in their dropdowns. Legacy claude-* aliases
+// included for backward compat; sidecar-specific gpt-5.x names
+// included so direct-OpenAI callers see what's actually available.
+function openAIModelsResponse() {
+  const now = Math.floor(Date.now() / 1000);
+  const models = [
+    // Tier names — preferred vocabulary. Router maps to real backend
+    // per LLM_ROUTER_MODE. These are what new configs should pick.
+    { id: 'flagship', object: 'model', created: now, owned_by: 'llm-router', description: 'Reasoning-heavy tier — opus/gpt-5.5 class' },
+    { id: 'balanced', object: 'model', created: now, owned_by: 'llm-router', description: 'Production default — sonnet/gpt-5.4 class' },
+    { id: 'fast',     object: 'model', created: now, owned_by: 'llm-router', description: 'Cheap/quick — haiku/gpt-5.4-mini class' },
+    // Legacy claude-* aliases — still supported, router infers tier
+    // from substring (opus→flagship, sonnet→balanced, haiku→fast).
+    { id: 'claude-opus-4-7',             object: 'model', created: now, owned_by: 'anthropic-legacy' },
+    { id: 'claude-sonnet-4-6',           object: 'model', created: now, owned_by: 'anthropic-legacy' },
+    { id: 'claude-haiku-4-5',            object: 'model', created: now, owned_by: 'anthropic-legacy' },
+    // OpenAI direct names — when PROVIDER_PRIMARY=openai, these serve natively
+    { id: 'gpt-5.5',      object: 'model', created: now, owned_by: 'openai-direct' },
+    { id: 'gpt-5.4',      object: 'model', created: now, owned_by: 'openai-direct' },
+    { id: 'gpt-5.4-mini', object: 'model', created: now, owned_by: 'openai-direct' },
+  ];
+  return { object: 'list', data: models };
+}
+
+function isModelsEndpoint(urlPath) {
+  return urlPath === '/v1/models' || urlPath.startsWith('/v1/models?') || urlPath === '/models';
+}
+
 // ─── HTTP server ──────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
+  // /v1/models — synthetic catalog so UIs auto-discover tier names
+  if (isModelsEndpoint(req.url) && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(openAIModelsResponse()));
+    return;
+  }
+
   // Health probe
   if (req.url === '/health' || req.url === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
