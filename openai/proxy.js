@@ -16,7 +16,7 @@
 const http = require('http');
 const crypto = require('crypto');
 
-const VERSION = '0.2.1';
+const VERSION = '0.3.0';
 
 // ─── Configuration ────────────────────────────────────────────────
 const PROXY_HOST = process.env.PROXY_HOST || '0.0.0.0';
@@ -488,6 +488,139 @@ async function handleMessages(req, res, bodyBuf) {
   res.end(anthropicShaped);
 }
 
+// ─── /v1/chat/completions handler (native OpenAI passthrough) ─────
+// Callers like Recallium speak OpenAI shape directly. No
+// Anthropic↔OpenAI translation needed — only model-name rewrite to
+// produce a sidecar-valid model name. Body + response pass through
+// unchanged. Streaming supported: if caller sets stream:true we pipe
+// the SSE bytes straight from sidecar to caller.
+async function handleChatCompletions(req, res, bodyBuf) {
+  metrics.inFlight += 1;
+  const caller = req.headers['x-router-caller'] || req.headers['x-caller'] || 'unknown';
+  const bodyStr = bodyBuf.toString('utf8');
+
+  let parsed;
+  try { parsed = JSON.parse(bodyStr); } catch (e) {
+    metrics.inFlight -= 1;
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Invalid JSON body: ' + e.message } }));
+    return;
+  }
+  const originalModel = parsed.model || '';
+  const resolved = resolveModel(originalModel);
+  parsed.model = resolved.openaiModel;
+  const isStreaming = parsed.stream === true;
+  const rewritten = JSON.stringify(parsed);
+  const rewrittenBuf = Buffer.from(rewritten, 'utf8');
+
+  const opts = {
+    host: SIDECAR_HOST,
+    port: SIDECAR_PORT,
+    method: 'POST',
+    path: '/v1/chat/completions',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': rewrittenBuf.length,
+      'Accept': isStreaming ? 'text/event-stream' : 'application/json',
+    },
+    timeout: SIDECAR_TIMEOUT_MS,
+  };
+
+  const start = process.hrtime.bigint();
+  const hreq = http.request(opts, (hres) => {
+    const status = hres.statusCode || 0;
+    // For streaming: pipe chunks straight to the caller, no buffering.
+    if (isStreaming && status >= 200 && status < 300) {
+      const respHeaders = {};
+      for (const [k, v] of Object.entries(hres.headers)) {
+        const lk = k.toLowerCase();
+        if (lk === 'content-length') continue;
+        respHeaders[k] = v;
+      }
+      res.writeHead(status, respHeaders);
+      hres.pipe(res);
+      hres.on('end', () => {
+        const dur = Number(process.hrtime.bigint() - start) / 1e9;
+        observeHistogram(metrics.durationBuckets, { caller, model_out: resolved.openaiModel }, dur);
+        incCounter(metrics.requestsTotal, {
+          caller,
+          model_in: originalModel || 'unknown',
+          model_out: resolved.openaiModel,
+          status: String(status),
+        });
+        console.log(`[openai-proxy] stream-ok caller=${caller} in=${originalModel||'?'} out=${resolved.openaiModel} dur=${dur.toFixed(3)}s`);
+        metrics.inFlight -= 1;
+      });
+      return;
+    }
+    // Non-streaming: buffer
+    const chunks = [];
+    hres.on('data', c => chunks.push(c));
+    hres.on('end', () => {
+      const dur = Number(process.hrtime.bigint() - start) / 1e9;
+      const body = Buffer.concat(chunks).toString('utf8');
+      observeHistogram(metrics.durationBuckets, { caller, model_out: resolved.openaiModel }, dur);
+      incCounter(metrics.requestsTotal, {
+        caller,
+        model_in: originalModel || 'unknown',
+        model_out: resolved.openaiModel,
+        status: String(status),
+      });
+      // Approximate tokens for the /v1/chat/completions path as well.
+      // Sidecar returns OpenAI usage {0,0,0} — same problem as /v1/messages.
+      let finalBody = body;
+      if (status >= 200 && status < 300) {
+        try {
+          const respObj = JSON.parse(body);
+          if (respObj.usage && respObj.usage.prompt_tokens === 0 && respObj.usage.completion_tokens === 0) {
+            // Text is in choices[].message.content for non-streaming
+            const promptParts = (parsed.messages || []).map(m => typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '')).join('\n');
+            const respText = (respObj.choices || []).map(c => (c.message && c.message.content) || '').join('\n');
+            const approxIn = approxTokens(promptParts);
+            const approxOut = approxTokens(respText);
+            respObj.usage.prompt_tokens = approxIn;
+            respObj.usage.completion_tokens = approxOut;
+            respObj.usage.total_tokens = approxIn + approxOut;
+            respObj.usage.approx = true;
+            finalBody = JSON.stringify(respObj);
+            incCounter(metrics.tokensApprox, { caller, model_out: resolved.openaiModel, direction: 'in' }, approxIn);
+            incCounter(metrics.tokensApprox, { caller, model_out: resolved.openaiModel, direction: 'out' }, approxOut);
+          }
+        } catch (_) { /* pass through verbatim */ }
+      }
+      const respHeaders = {};
+      for (const [k, v] of Object.entries(hres.headers)) {
+        const lk = k.toLowerCase();
+        if (lk === 'content-length' || lk === 'transfer-encoding') continue;
+        respHeaders[k] = v;
+      }
+      res.writeHead(status, respHeaders);
+      res.end(finalBody);
+      console.log(`[openai-proxy] chat-ok caller=${caller} in=${originalModel||'?'} out=${resolved.openaiModel} status=${status} dur=${dur.toFixed(3)}s`);
+      metrics.inFlight -= 1;
+    });
+  });
+  hreq.on('timeout', () => hreq.destroy(new Error('sidecar_timeout')));
+  hreq.on('error', (e) => {
+    const dur = Number(process.hrtime.bigint() - start) / 1e9;
+    observeHistogram(metrics.durationBuckets, { caller, model_out: resolved.openaiModel }, dur);
+    incCounter(metrics.requestsTotal, {
+      caller,
+      model_in: originalModel || 'unknown',
+      model_out: resolved.openaiModel,
+      status: '0',
+    });
+    console.error(`[openai-proxy] chat-err caller=${caller} err=${e.message}`);
+    metrics.inFlight -= 1;
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'upstream_error', message: `sidecar unreachable: ${e.message}` } }));
+    }
+  });
+  hreq.write(rewrittenBuf);
+  hreq.end();
+}
+
 // ─── HTTP server ──────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/healthz') {
@@ -508,12 +641,15 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Only /v1/messages POST is handled. Everything else 404.
-  if (!(req.url === '/v1/messages' || req.url.startsWith('/v1/messages?')) || req.method !== 'POST') {
+  // Two POST endpoints: /v1/messages (Anthropic shape, translates) and
+  // /v1/chat/completions (OpenAI shape, passes through). Everything else 404s.
+  const isMsg = (req.url === '/v1/messages' || req.url.startsWith('/v1/messages?')) && req.method === 'POST';
+  const isChat = (req.url === '/v1/chat/completions' || req.url.startsWith('/v1/chat/completions?')) && req.method === 'POST';
+  if (!isMsg && !isChat) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       type: 'error',
-      error: { type: 'not_found', message: `openai-proxy only handles POST /v1/messages; got ${req.method} ${req.url}` },
+      error: { type: 'not_found', message: `openai-proxy handles POST /v1/messages or /v1/chat/completions; got ${req.method} ${req.url}` },
     }));
     return;
   }
@@ -522,7 +658,11 @@ const server = http.createServer((req, res) => {
   req.on('data', c => chunks.push(c));
   req.on('end', async () => {
     try {
-      await handleMessages(req, res, Buffer.concat(chunks));
+      if (isChat) {
+        await handleChatCompletions(req, res, Buffer.concat(chunks));
+      } else {
+        await handleMessages(req, res, Buffer.concat(chunks));
+      }
     } catch (e) {
       console.error('[openai-proxy] unhandled:', e.stack || e.message);
       if (!res.headersSent) {

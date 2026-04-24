@@ -18,7 +18,7 @@ const http = require('http');
 const url = require('url');
 const crypto = require('crypto');
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 // ─── Configuration ────────────────────────────────────────────────
 const PROXY_HOST = process.env.PROXY_HOST || '0.0.0.0';
@@ -120,6 +120,22 @@ function extractModel(bodyStr) {
 
 function isAnthropicMessages(urlPath) {
   return urlPath === '/v1/messages' || urlPath.startsWith('/v1/messages?');
+}
+
+// /v1/chat/completions is the OpenAI-compat path. Callers like Recallium
+// send OpenAI-shaped bodies here with claude-* or tier model names. Both
+// backends can serve it:
+//   openai-proxy: forward to sidecar (native OpenAI format, model-name rewrite)
+//   anthropic-proxy: translate OpenAI→Anthropic (inherited from v2.x)
+function isOpenAIChatCompletions(urlPath) {
+  return urlPath === '/v1/chat/completions' || urlPath.startsWith('/v1/chat/completions?');
+}
+
+// Any path the router should route through primary/fallback rather than
+// passthrough. Non-routed paths (e.g., /v1/models) still passthrough to
+// anthropic since it's the metadata source.
+function isRoutedPath(urlPath) {
+  return isAnthropicMessages(urlPath) || isOpenAIChatCompletions(urlPath);
 }
 
 function parseBackendURL(urlStr) {
@@ -313,18 +329,17 @@ const server = http.createServer((req, res) => {
   req.on('end', async () => {
     const bodyBuf = Buffer.concat(chunks);
 
-    // For non-messages paths, always go to anthropic backend. Those are
-    // legacy paths (chat-completions translation, /v1/models) that we
-    // don't multi-route. If someone needs OpenAI-compat without the
-    // full Anthropic-primary switch, they can hit openai-proxy directly.
-    if (!isAnthropicMessages(req.url) || req.method !== 'POST') {
+    // Only POST on routed paths (/v1/messages + /v1/chat/completions)
+    // gets primary/fallback treatment. Everything else (GET /v1/models,
+    // etc.) passthroughs to anthropic — that's the metadata source.
+    if (!isRoutedPath(req.url) || req.method !== 'POST') {
       const caller = extractCaller(req.headers);
       const result = await forwardToBackend(ANTHROPIC_URL, req.method, req.url, req.headers, bodyBuf, 'anthropic', caller, 'passthrough');
       respondWith(res, result, 'anthropic', 'passthrough', caller, 'passthrough');
       return;
     }
 
-    // Messages path — full router logic
+    // Routed path — full primary/fallback logic
     try {
       await route(req, res, bodyBuf);
     } catch (e) {
